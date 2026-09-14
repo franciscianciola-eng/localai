@@ -325,8 +325,14 @@ function activeModelId() {
 // The worker is respawned during recovery: onnxruntime latches a failed wasm
 // init inside a worker, so retrying with different settings needs a fresh one.
 let worker = null;
-const workerOpts = {}; // numThreads / wasmSource, applied on every (re)spawn
+const workerOpts = {}; // numThreads / wasmSource / forceWasm, applied on every (re)spawn
 const recovery = { cacheCleared: false, singleThread: false, cdnWasm: false };
+let genRetryUsed = false; // one automatic recovery per user message
+try {
+  // A previous GPU inference crash on this device: stay on the CPU engine.
+  if (localStorage.getItem("localai-force-wasm") === "1") workerOpts.forceWasm = true;
+} catch {}
+if (params.get("crashgen")) workerOpts.testCrashGenerate = true; // test hook
 
 function spawnWorker() {
   if (worker) worker.terminate();
@@ -440,6 +446,7 @@ function send(text) {
   try { sessionStorage.removeItem("localai-draft"); } catch {}
   addBubble("user", content);
   history.push({ role: "user", content });
+  genRetryUsed = false; // fresh crash-recovery budget for this message
   if (ready) {
     startGeneration();
   } else {
@@ -479,6 +486,9 @@ function diagnose(failures, diag) {
   if (kinds.has("network") && hf && hf.ok && hf.validJson !== false) {
     lines.push("The model host answered errors while downloading files — often a temporary outage. Hit Retry in a minute.");
   }
+  if (kinds.has("engine-crash")) {
+    lines.push("The AI engine crashed inside this device's graphics or WebAssembly runtime — the app will avoid the crashing configuration from now on.");
+  }
   if (diag.vendorWasm && !diag.vendorWasm.ok) {
     if (diag.jsdelivr && diag.jsdelivr.ok) {
       lines.push("This host isn't serving the app's runtime files; the CDN copy was used as a fallback.");
@@ -506,7 +516,7 @@ function maybeSelfHeal(failures, diag) {
   // the wasm path implicate it; a WebGPU failure says nothing about COI.
   const hfReachable = !diag.huggingface || diag.huggingface.ok;
   const suspicious = failures.some(
-    (f) => f.device === "wasm" && (f.kind === "backend" || f.kind === "unknown")
+    (f) => f.device === "wasm" && (f.kind === "backend" || f.kind === "unknown" || f.kind === "engine-crash")
   );
   let alreadyOff = false;
   try { alreadyOff = localStorage.getItem("localai-coi-off") === "1"; } catch {}
@@ -649,6 +659,36 @@ function handleWorkerMessage(e) {
       speedChip.hidden = true;
       updateUiState();
       chatEl.scrollTop = chatEl.scrollHeight;
+      break;
+    }
+    case "generate-failed": {
+      generating = false;
+      speedChip.hidden = true;
+      if (currentBubble) {
+        currentBubble.parentElement?.remove(); // discard the partial reply
+        currentBubble = null;
+      }
+      if (!genRetryUsed) {
+        // One automatic recovery per message: reload the model in a fresh
+        // worker on a safer configuration and answer the message again.
+        genRetryUsed = true;
+        delete workerOpts.testCrashGenerate;
+        if (msg.device === "webgpu") {
+          workerOpts.forceWasm = true;
+          try { localStorage.setItem("localai-force-wasm", "1"); } catch {}
+        }
+        awaitingModel = true;
+        setNote("The AI engine crashed mid-reply — restarting in a safer mode and retrying…", true);
+        spawnWorker();
+        loadModel();
+        break;
+      }
+      const human = /^\d+$/.test((msg.message || "").trim())
+        ? "The AI engine crashed with an internal error (code " + msg.message + ")."
+        : msg.message;
+      addBubble("bot", "⚠️ " + human + "\n\nTry the smallest model from the dropdown, or reload the page.");
+      setNote("Generation failed — try a smaller model.", true);
+      updateUiState();
       break;
     }
     case "error": {

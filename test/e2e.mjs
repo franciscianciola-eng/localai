@@ -128,7 +128,32 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
-// ---------- Test 3: filter serving a 200 HTML block page -> detected ----------
+// ---------- Test 3: engine crash mid-generation -> auto-recover + regenerate ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await page.goto(
+    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/&crashgen=1`,
+    { waitUntil: "load" }
+  );
+  await page.fill("#input", "Crash then recover");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 120000 })
+    .then(() => true)
+    .catch(() => false);
+  check("reply completes after engine crash recovery", replied);
+  if (replied) {
+    const botCount = await page.locator(".msg.bot").count();
+    check("crashed partial reply was discarded (one bot message)", botCount === 1, "count=" + botCount);
+    const bodyText = await page.textContent("#messages");
+    check("no error text shown for recovered crash", !bodyText.includes("⚠️"), bodyText.slice(0, 200));
+    const forced = await page.evaluate(() => localStorage.getItem("localai-force-wasm"));
+    check("CPU crash does not blacklist the GPU", forced === null, String(forced));
+  }
+  await page.close();
+}
+
+// ---------- Test 4: filter serving a 200 HTML block page -> detected ----------
 {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   await page.goto(

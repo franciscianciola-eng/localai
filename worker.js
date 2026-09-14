@@ -20,6 +20,8 @@ env.backends.onnx.wasm.wasmPaths = VENDOR_URL;
 
 let generator = null;
 let loadedModelId = null;
+let currentConfig = null; // {device, dtype} of the loaded pipeline
+let crashGenOnce = false; // test hook: crash the next generation once
 let stoppingCriteria = new InterruptableStoppingCriteria();
 
 function errText(err) {
@@ -30,6 +32,10 @@ function errText(err) {
 // attempt in the ladder could still succeed.
 function classify(err) {
   const m = errText(err).toLowerCase();
+  // Emscripten C++ exceptions surface as a bare number (a pointer) — the
+  // signature of a native engine crash, typically a GPU driver failure.
+  if (/^\d+$/.test(m.trim()) || m.includes("unreachable") || m.includes("function signature mismatch"))
+    return "engine-crash";
   // Memory first: wasm OOM surfaces as "no available backend ... RangeError:
   // Out of memory" on low-RAM devices, which must not read as a backend bug.
   if (
@@ -57,11 +63,11 @@ function classify(err) {
   return "unknown";
 }
 
-async function buildAttempts() {
+async function buildAttempts(opts = {}) {
   const attempts = [];
   let adapter = null;
   try {
-    if (globalThis.navigator?.gpu) adapter = await navigator.gpu.requestAdapter();
+    if (!opts.forceWasm && globalThis.navigator?.gpu) adapter = await navigator.gpu.requestAdapter();
   } catch {}
   if (adapter) {
     if (adapter.features?.has?.("shader-f16")) attempts.push({ device: "webgpu", dtype: "q4f16" });
@@ -172,6 +178,7 @@ async function load(modelId, opts = {}) {
   // and passes the adjusted configuration instead of retrying in place.
   if (opts.numThreads) env.backends.onnx.wasm.numThreads = opts.numThreads;
   if (opts.wasmSource === "cdn") env.backends.onnx.wasm.wasmPaths = CDN_DIST;
+  if (opts.testCrashGenerate) crashGenOnce = true; // test hook
 
   if (generator && loadedModelId === modelId) {
     self.postMessage({ type: "ready", modelId });
@@ -185,7 +192,7 @@ async function load(modelId, opts = {}) {
     loadedModelId = null;
   }
 
-  const attempts = await buildAttempts();
+  const attempts = await buildAttempts(opts);
   const failures = [];
 
   for (const a of attempts) {
@@ -212,6 +219,7 @@ async function load(modelId, opts = {}) {
         progress_callback: makeProgressReporter(label),
       });
       loadedModelId = modelId;
+      currentConfig = { device: a.device, dtype: a.dtype };
       self.postMessage({ type: "ready", modelId, device: a.device, dtype: a.dtype });
       return;
     } catch (err) {
@@ -264,15 +272,33 @@ async function generate(messages, params = {}) {
     },
   });
 
-  await generator(messages, {
-    max_new_tokens: params.max_new_tokens ?? 512,
-    do_sample: true,
-    temperature: params.temperature ?? 0.6,
-    top_p: params.top_p ?? 0.9,
-    repetition_penalty: params.repetition_penalty ?? 1.1,
-    streamer,
-    stopping_criteria: stoppingCriteria,
-  });
+  try {
+    if (crashGenOnce) {
+      crashGenOnce = false;
+      throw 576720528; // test hook: emulate a raw Emscripten engine crash
+    }
+    await generator(messages, {
+      max_new_tokens: params.max_new_tokens ?? 512,
+      do_sample: true,
+      temperature: params.temperature ?? 0.6,
+      top_p: params.top_p ?? 0.9,
+      repetition_penalty: params.repetition_penalty ?? 1.1,
+      streamer,
+      stopping_criteria: stoppingCriteria,
+    });
+  } catch (err) {
+    // Inference crashed (typically a native/GPU engine failure). Report with
+    // context so the page can reload on a safer configuration and regenerate.
+    self.postMessage({
+      type: "generate-failed",
+      message: errText(err),
+      kind: classify(err),
+      device: currentConfig?.device,
+      dtype: currentConfig?.dtype,
+      partial: text,
+    });
+    return;
+  }
 
   const totalSec = (performance.now() - startedAt) / 1000;
   const genSec = firstTokenAt ? (performance.now() - firstTokenAt) / 1000 : 0;
