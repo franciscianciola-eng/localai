@@ -516,10 +516,15 @@ function showLoadError(failures, diag) {
     '<button id="smallestBtn">Try smallest model</button></div>';
   messagesEl.appendChild(card);
   errorCard = card;
-  card.querySelector("#retryBtn").addEventListener("click", loadModel);
+  // Respawn on retry: a failed wasm init is latched for the worker's lifetime.
+  card.querySelector("#retryBtn").addEventListener("click", () => {
+    spawnWorker();
+    loadModel();
+  });
   card.querySelector("#smallestBtn").addEventListener("click", () => {
     modelSelect.value = "smollm2-135m";
     try { localStorage.setItem("localai-model", "smollm2-135m"); } catch {}
+    spawnWorker();
     loadModel();
   });
   heroEl.hidden = true;
