@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LocalAI — private AI chat in your browser</title>
+<meta name="description" content="A tiny, efficient AI chatbot that runs 100% locally in your browser using public open weights. No server, no API key, no data leaves your device.">
+<script>
+// Cross-origin isolation bootstrap: registers a service worker that adds
+// COOP/COEP headers so WASM inference can use all CPU cores. One reload on the
+// very first visit; a no-op afterwards. The app works without it (slower CPU path).
+(() => {
+  try {
+    if (window.crossOriginIsolated) return;
+    if (!("serviceWorker" in navigator)) return;
+    const local = ["localhost", "127.0.0.1"].includes(location.hostname);
+    if (location.protocol !== "https:" && !local) return;
+    navigator.serviceWorker.register("./coi-serviceworker.js").then(() => {
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        try {
+          if (!sessionStorage.getItem("coi-reloaded")) {
+            sessionStorage.setItem("coi-reloaded", "1");
+            location.reload();
+          }
+        } catch {}
+      });
+    }).catch(() => {});
+  } catch {}
+})();
+</script>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --panel-2: #eef0f3;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --accent: #4f6ef7;
+    --accent-text: #ffffff;
+    --user-bubble: #4f6ef7;
+    --user-text: #ffffff;
+    --bot-bubble: #ffffff;
+    --border: #dfe2e8;
+    --code-bg: #eef0f3;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1116;
+      --panel: #161b22;
+      --panel-2: #1f2630;
+      --text: #e6e8eb;
+      --muted: #8b939e;
+      --accent: #6c8cff;
+      --accent-text: #0e1116;
+      --user-bubble: #33415e;
+      --user-text: #e6e8eb;
+      --bot-bubble: #161b22;
+      --border: #2a323d;
+      --code-bg: #10141a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .logo { font-weight: 700; font-size: 16px; letter-spacing: .2px; }
+  .logo span { color: var(--accent); }
+  select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font: inherit;
+    max-width: 46vw;
+  }
+  .chip {
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 10px;
+    white-space: nowrap;
+  }
+  .chip.ok { color: #22a06b; border-color: #22a06b55; }
+  .spacer { flex: 1; }
+  button {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.06); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  button.danger { color: #e5534b; border-color: #e5534b66; }
+
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px 16px 8px;
+  }
+  .inner { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
+  .msg { display: flex; }
+  .msg.user { justify-content: flex-end; }
+  .bubble {
+    max-width: 85%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .msg.user .bubble { background: var(--user-bubble); color: var(--user-text); border-bottom-right-radius: 4px; }
+  .msg.bot .bubble { background: var(--bot-bubble); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .bubble pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    overflow-x: auto;
+    white-space: pre;
+    font-size: 13px;
+    margin: 8px 0;
+  }
+  .bubble code { background: var(--code-bg); border-radius: 4px; padding: 1px 5px; font-size: 13px; }
+  .bubble pre code { background: none; padding: 0; }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .hero {
+    text-align: center;
+    margin: 8vh auto 0;
+    max-width: 520px;
+    color: var(--muted);
+  }
+  .hero h1 { color: var(--text); font-size: 26px; margin-bottom: 8px; }
+  .hero .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
+  .hero .suggestions button { font-size: 13px; }
+
+  #loader {
+    position: fixed;
+    inset: auto 16px 84px 16px;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+  }
+  #loader .card {
+    pointer-events: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.25);
+    padding: 14px 18px;
+    width: min(480px, 100%);
+  }
+  #loader .row { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); gap: 12px; }
+  #bar { height: 6px; background: var(--panel-2); border-radius: 3px; margin: 10px 0 6px; overflow: hidden; }
+  #barfill { height: 100%; width: 0%; background: var(--accent); border-radius: 3px; transition: width .15s; }
+
+  footer {
+    padding: 10px 16px calc(12px + env(safe-area-inset-bottom));
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1;
+    resize: none;
+    font: inherit;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 14px;
+    max-height: 160px;
+    outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  .foot-note { max-width: 760px; margin: 6px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Local<span>AI</span></div>
+  <select id="modelSelect" title="Model"></select>
+  <span class="chip" id="deviceChip">detecting…</span>
+  <span class="chip" id="speedChip" hidden></span>
+  <div class="spacer"></div>
+  <button id="clearBtn" title="Clear the conversation">Clear</button>
+</header>
+
+<div id="chat">
+  <div class="inner" id="messages">
+    <div class="hero" id="hero">
+      <h1>Chat with an AI that lives in this tab</h1>
+      <p>Open-weight model, downloaded once and cached, running entirely on your device.
+         No server, no account, no data sent anywhere.</p>
+      <div class="suggestions">
+        <button data-q="Explain how a rainbow forms, in three sentences.">Explain a rainbow</button>
+        <button data-q="Write a short, funny poem about a Chromebook.">Chromebook poem</button>
+        <button data-q="Give me three ideas for a healthy 10-minute dinner.">Quick dinner ideas</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="loader" hidden>
+  <div class="card">
+    <div class="row"><strong id="loadTitle" style="color:var(--text)">Loading model…</strong><span id="loadPct">0%</span></div>
+    <div id="bar"><div id="barfill"></div></div>
+    <div class="row"><span id="loadDetail">Preparing…</span><span id="loadSize"></span></div>
+  </div>
+</div>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Message the local AI…" autofocus></textarea>
+    <button class="primary" id="sendBtn" disabled>Send</button>
+    <button class="danger" id="stopBtn" hidden>Stop</button>
+  </div>
+  <div class="foot-note">Runs 100% locally in your browser · first use downloads the model once, then it's cached</div>
+</footer>
+
+<script type="module">
+const MODELS = {
+  "smollm2-135m": {
+    id: "onnx-community/SmolLM2-135M-Instruct-ONNX",
+    label: "SmolLM2 135M · fastest (~0.1 GB)",
+  },
+  "smollm2-360m": {
+    id: "onnx-community/SmolLM2-360M-Instruct-ONNX",
+    label: "SmolLM2 360M · balanced (~0.3 GB)",
+  },
+  "qwen25-05b": {
+    id: "onnx-community/Qwen2.5-0.5B-Instruct",
+    label: "Qwen2.5 0.5B · smartest (~0.5 GB)",
+  },
+};
+const DEFAULT_MODEL = "smollm2-360m";
+const SYSTEM_PROMPT =
+  "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
+  "Answer clearly and concisely in plain language. If you are unsure, say so.";
+
+const $ = (id) => document.getElementById(id);
+const chatEl = $("chat");
+const messagesEl = $("messages");
+const heroEl = $("hero");
+const inputEl = $("input");
+const sendBtn = $("sendBtn");
+const stopBtn = $("stopBtn");
+const clearBtn = $("clearBtn");
+const modelSelect = $("modelSelect");
+const deviceChip = $("deviceChip");
+const speedChip = $("speedChip");
+const loaderEl = $("loader");
+
+let history = []; // {role, content}
+let ready = false;
+let generating = false;
+let currentBubble = null;
+let currentText = "";
+
+for (const [key, m] of Object.entries(MODELS)) {
+  const opt = document.createElement("option");
+  opt.value = key;
+  opt.textContent = m.label;
+  modelSelect.appendChild(opt);
+}
+let savedModel = DEFAULT_MODEL;
+try { savedModel = localStorage.getItem("localai-model") || DEFAULT_MODEL; } catch {}
+if (!MODELS[savedModel]) savedModel = DEFAULT_MODEL;
+modelSelect.value = savedModel;
+
+const worker = new Worker("./worker.js", { type: "module" });
+
+function fmtMB(bytes) { return (bytes / 1048576).toFixed(0) + " MB"; }
+
+function setLoading(on, title) {
+  loaderEl.hidden = !on;
+  if (title) $("loadTitle").textContent = title;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Minimal safe renderer: code fences, inline code, bold. Everything else is
+// escaped text with newlines preserved by the bubble's white-space:pre-wrap.
+function render(text) {
+  const parts = text.split(/```(?:\w*\n)?/);
+  let html = "";
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      html += "<pre><code>" + escapeHtml(parts[i].replace(/\n$/, "")) + "</code></pre>";
+    } else {
+      html += escapeHtml(parts[i])
+        .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+        .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    }
+  }
+  return html;
+}
+
+function addBubble(role, text) {
+  heroEl.hidden = true;
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + (role === "user" ? "user" : "bot");
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.innerHTML = render(text);
+  wrap.appendChild(bubble);
+  messagesEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return bubble;
+}
+
+function updateUiState() {
+  sendBtn.disabled = !ready || generating || !inputEl.value.trim();
+  sendBtn.hidden = generating;
+  stopBtn.hidden = !generating;
+  modelSelect.disabled = generating;
+}
+
+function loadModel() {
+  ready = false;
+  setLoading(true, "Loading " + MODELS[modelSelect.value].label.split(" · ")[0] + "…");
+  $("barfill").style.width = "0%";
+  $("loadPct").textContent = "0%";
+  $("loadDetail").textContent = "Preparing… (cached models load instantly)";
+  $("loadSize").textContent = "";
+  worker.postMessage({ type: "load", modelId: MODELS[modelSelect.value].id });
+  updateUiState();
+}
+
+function send(text) {
+  const content = (text ?? inputEl.value).trim();
+  if (!content || !ready || generating) return;
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+  addBubble("user", content);
+  history.push({ role: "user", content });
+
+  // Keep the prompt small for speed on modest hardware: system + recent turns.
+  const recent = history.slice(-12);
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...recent];
+
+  generating = true;
+  currentText = "";
+  currentBubble = addBubble("bot", "");
+  currentBubble.innerHTML = '<span class="cursor"></span>';
+  speedChip.hidden = false;
+  speedChip.textContent = "thinking…";
+  updateUiState();
+  worker.postMessage({ type: "generate", messages, params: {} });
+}
+
+worker.addEventListener("message", (e) => {
+  const msg = e.data;
+  switch (msg.type) {
+    case "device": {
+      const label = msg.device === "webgpu"
+        ? "WebGPU · " + msg.dtype
+        : "CPU · " + msg.threads + (msg.threads > 1 ? " threads" : " thread");
+      deviceChip.textContent = label;
+      deviceChip.className = "chip" + (msg.device === "webgpu" ? " ok" : "");
+      deviceChip.title = msg.note || (msg.device === "webgpu"
+        ? "Accelerated by your GPU"
+        : "Running on the CPU" + (msg.crossOriginIsolated ? "" : " (single-threaded — reload once to enable multithreading)"));
+      break;
+    }
+    case "progress": {
+      $("barfill").style.width = msg.pct + "%";
+      $("loadPct").textContent = msg.pct + "%";
+      $("loadDetail").textContent = "Downloading " + (msg.file || "model") + "…";
+      if (msg.total) $("loadSize").textContent = fmtMB(msg.loaded) + " / " + fmtMB(msg.total);
+      break;
+    }
+    case "ready": {
+      ready = true;
+      setLoading(false);
+      updateUiState();
+      inputEl.focus();
+      break;
+    }
+    case "token": {
+      currentText += msg.text;
+      if (currentBubble) {
+        currentBubble.innerHTML = render(currentText) + '<span class="cursor"></span>';
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+      if (msg.tps > 0) speedChip.textContent = msg.tps.toFixed(1) + " tok/s";
+      break;
+    }
+    case "done": {
+      const finalText = (msg.text || currentText).trim() || "(no response — try again)";
+      if (currentBubble) {
+        currentBubble.innerHTML = render(finalText);
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = msg.stats.tokens + " tokens · " + msg.stats.tps.toFixed(1) + " tok/s";
+        currentBubble.appendChild(meta);
+      }
+      history.push({ role: "assistant", content: finalText });
+      generating = false;
+      currentBubble = null;
+      speedChip.hidden = true;
+      updateUiState();
+      chatEl.scrollTop = chatEl.scrollHeight;
+      break;
+    }
+    case "error": {
+      setLoading(false);
+      if (currentBubble) {
+        currentBubble.innerHTML = render("⚠️ " + msg.message);
+        currentBubble = null;
+      } else {
+        addBubble("bot", "⚠️ " + msg.message +
+          "\n\nIf this is the first load, check your internet connection and reload the page.");
+      }
+      generating = false;
+      speedChip.hidden = true;
+      updateUiState();
+      break;
+    }
+  }
+});
+
+worker.addEventListener("error", (e) => {
+  setLoading(false);
+  ready = false;
+  generating = false;
+  deviceChip.textContent = "engine failed";
+  addBubble("bot",
+    "⚠️ Couldn't start the AI engine" + (e.message ? ": " + e.message : "") +
+    "\n\nThe inference library loads from a CDN on first visit. Check your internet connection and reload the page — after the first successful load everything is cached.");
+  updateUiState();
+});
+
+sendBtn.addEventListener("click", () => send());
+stopBtn.addEventListener("click", () => worker.postMessage({ type: "stop" }));
+clearBtn.addEventListener("click", () => {
+  history = [];
+  messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
+  heroEl.hidden = false;
+});
+modelSelect.addEventListener("change", () => {
+  try { localStorage.setItem("localai-model", modelSelect.value); } catch {}
+  loadModel();
+});
+inputEl.addEventListener("input", () => {
+  inputEl.style.height = "auto";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+  updateUiState();
+});
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    send();
+  }
+});
+heroEl.addEventListener("click", (e) => {
+  const q = e.target?.dataset?.q;
+  if (q) {
+    inputEl.value = q;
+    updateUiState();
+    if (ready) send();
+  }
+});
+
+loadModel();
+</script>
+</body>
+</html>
