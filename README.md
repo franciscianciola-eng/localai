@@ -9,17 +9,18 @@ straight from GitHub links and works on a Chromebook.
 
 | Link | Notes |
 |---|---|
-| **https://franciscianciola-eng.github.io/localai/** | GitHub Pages — the main link. Deployed automatically by the included workflow. |
-| **https://raw.githack.com/franciscianciola-eng/localai/claude/eager-cori-r6fqfl/index.html** | Works immediately from the branch, no setup at all. |
+| **https://raw.githack.com/franciscianciola-eng/localai/claude/eager-cori-r6fqfl/index.html** | Works right now, straight from the repo — zero setup. |
+| **https://franciscianciola-eng.github.io/localai/** | GitHub Pages — the nicer permanent link, needs the one-click setup below. |
 
 The **first** open downloads the model once (about 100–500 MB depending on the
 model you pick) and caches it in the browser. Every open after that starts
 **instantly**, straight from cache.
 
-> If the GitHub Pages link shows a 404: the deploy workflow tries to enable
-> Pages automatically, but if your repo settings block that, enable it once
-> under **Settings → Pages → Source: GitHub Actions**, then re-run the
-> "Deploy to GitHub Pages" workflow.
+> **One-time setup for the Pages link** (GitHub doesn't let workflows enable
+> Pages by themselves): go to **Settings → Pages** and set **Source** to
+> **GitHub Actions**, then re-run the "Deploy to GitHub Pages" workflow from
+> the Actions tab (or push any commit). Every later push deploys
+> automatically.
 
 You can also run it locally with any static file server:
 
