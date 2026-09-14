@@ -376,6 +376,7 @@ function updateUiState() {
   sendBtn.hidden = generating;
   stopBtn.hidden = !generating;
   modelSelect.disabled = generating;
+  clearBtn.disabled = generating;
 }
 
 function showLoader(title) {
@@ -648,10 +649,17 @@ function handleWorkerError(e) {
   loaderEl.hidden = true;
   ready = false;
   generating = false;
+  awaitingModel = false;
+  speedChip.hidden = true;
+  if (currentBubble) {
+    currentBubble.innerHTML = render("⚠️ The AI engine crashed mid-reply.");
+    currentBubble = null;
+  }
   deviceChip.textContent = "engine failed";
   addBubble("bot",
     "⚠️ Couldn't start the AI engine" + (e.message ? ": " + e.message : "") +
     "\n\nReload the page to try again. If it keeps failing, the host may not be serving the app's files correctly.");
+  setNote("Engine failed — reload the page to try again.", true);
   updateUiState();
 }
 
@@ -666,7 +674,10 @@ clearBtn.addEventListener("click", () => {
 });
 modelSelect.addEventListener("change", () => {
   try { localStorage.setItem("localai-model", modelSelect.value); } catch {}
-  awaitingModel = false;
+  // Respawn so an in-flight load of the previous model can't race this one
+  // (two concurrent load() calls in one worker let the abandoned model win).
+  // awaitingModel is kept: a queued message is answered by the new model.
+  spawnWorker();
   loadModel();
 });
 inputEl.addEventListener("input", () => {
