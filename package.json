@@ -1,0 +1,12 @@
+{
+  "name": "localai",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Private AI chat that runs 100% in the browser",
+  "scripts": {
+    "test": "node test/e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

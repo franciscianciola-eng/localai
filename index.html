@@ -8,8 +8,14 @@
 <script>
 // Cross-origin isolation bootstrap: registers a service worker that adds
 // COOP/COEP headers so WASM inference can use all CPU cores. One reload on the
-// very first visit; a no-op afterwards. The app works without it (slower CPU path).
+// very first visit; a no-op afterwards. The app works without it (slower CPU
+// path). Skipped when compatibility mode was engaged (?nocoi=1 or after a
+// failed isolated load) — the app then runs single-threaded but reliably.
 (() => {
+  try {
+    if (new URLSearchParams(location.search).has("nocoi")) return;
+    if (localStorage.getItem("localai-coi-off") === "1") return;
+  } catch {}
   try {
     if (window.crossOriginIsolated) return;
     if (!("serviceWorker" in navigator)) return;
@@ -42,6 +48,7 @@
     --bot-bubble: #ffffff;
     --border: #dfe2e8;
     --code-bg: #eef0f3;
+    --warn: #b45309;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
@@ -58,6 +65,7 @@
       --bot-bubble: #161b22;
       --border: #2a323d;
       --code-bg: #10141a;
+      --warn: #fbbf24;
     }
   }
   * { box-sizing: border-box; }
@@ -155,7 +163,7 @@
 
   .hero {
     text-align: center;
-    margin: 8vh auto 0;
+    margin: 6vh auto 0;
     max-width: 520px;
     color: var(--muted);
   }
@@ -163,25 +171,22 @@
   .hero .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
   .hero .suggestions button { font-size: 13px; }
 
-  #loader {
-    position: fixed;
-    inset: auto 16px 84px 16px;
-    display: flex;
-    justify-content: center;
-    pointer-events: none;
-  }
-  #loader .card {
-    pointer-events: auto;
+  .card {
     background: var(--panel);
     border: 1px solid var(--border);
     border-radius: 12px;
-    box-shadow: 0 8px 30px rgba(0,0,0,.25);
     padding: 14px 18px;
-    width: min(480px, 100%);
   }
-  #loader .row { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); gap: 12px; }
+  .card .row { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); gap: 12px; flex-wrap: wrap; }
+  .card .row strong { color: var(--text); }
   #bar { height: 6px; background: var(--panel-2); border-radius: 3px; margin: 10px 0 6px; overflow: hidden; }
   #barfill { height: 100%; width: 0%; background: var(--accent); border-radius: 3px; transition: width .15s; }
+  .card.error { border-color: #e5534b66; }
+  .card.error h3 { margin: 0 0 8px; font-size: 15px; }
+  .card.error ul { margin: 8px 0; padding-left: 20px; }
+  .card.error details { margin-top: 10px; font-size: 12px; color: var(--muted); }
+  .card.error pre { background: var(--code-bg); border-radius: 8px; padding: 8px; overflow-x: auto; font-size: 11px; }
+  .card .actions { margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap; }
 
   footer {
     padding: 10px 16px calc(12px + env(safe-area-inset-bottom));
@@ -203,6 +208,7 @@
   }
   textarea:focus { border-color: var(--accent); }
   .foot-note { max-width: 760px; margin: 6px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
+  .foot-note.warn { color: var(--warn); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -211,7 +217,7 @@
 <header>
   <div class="logo">Local<span>AI</span></div>
   <select id="modelSelect" title="Model"></select>
-  <span class="chip" id="deviceChip">detecting…</span>
+  <span class="chip" id="deviceChip">starting…</span>
   <span class="chip" id="speedChip" hidden></span>
   <div class="spacer"></div>
   <button id="clearBtn" title="Clear the conversation">Clear</button>
@@ -229,24 +235,21 @@
         <button data-q="Give me three ideas for a healthy 10-minute dinner.">Quick dinner ideas</button>
       </div>
     </div>
-  </div>
-</div>
-
-<div id="loader" hidden>
-  <div class="card">
-    <div class="row"><strong id="loadTitle" style="color:var(--text)">Loading model…</strong><span id="loadPct">0%</span></div>
-    <div id="bar"><div id="barfill"></div></div>
-    <div class="row"><span id="loadDetail">Preparing…</span><span id="loadSize"></span></div>
+    <div class="card" id="loader" hidden>
+      <div class="row"><strong id="loadTitle">Loading model…</strong><span id="loadPct">0%</span></div>
+      <div id="bar"><div id="barfill"></div></div>
+      <div class="row"><span id="loadDetail">Preparing… (cached models load instantly)</span><span id="loadSize"></span></div>
+    </div>
   </div>
 </div>
 
 <footer>
   <div class="composer">
-    <textarea id="input" rows="1" placeholder="Message the local AI…" autofocus></textarea>
+    <textarea id="input" rows="1" placeholder="Message the local AI…" autofocus autocomplete="off"></textarea>
     <button class="primary" id="sendBtn" disabled>Send</button>
     <button class="danger" id="stopBtn" hidden>Stop</button>
   </div>
-  <div class="foot-note">Runs 100% locally in your browser · first use downloads the model once, then it's cached</div>
+  <div class="foot-note" id="footNote">Runs 100% locally in your browser · first use downloads the model once, then it's cached</div>
 </footer>
 
 <script type="module">
@@ -269,6 +272,10 @@ const SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
 
+const params = new URLSearchParams(location.search);
+const customModelId = params.get("modelId"); // test/advanced hook
+const hubOverride = params.get("hub");       // test hook: alternate weights host
+
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat");
 const messagesEl = $("messages");
@@ -281,12 +288,15 @@ const modelSelect = $("modelSelect");
 const deviceChip = $("deviceChip");
 const speedChip = $("speedChip");
 const loaderEl = $("loader");
+const footNote = $("footNote");
 
 let history = []; // {role, content}
 let ready = false;
 let generating = false;
+let awaitingModel = false; // a user message is queued for when the model is ready
 let currentBubble = null;
 let currentText = "";
+let errorCard = null;
 
 for (const [key, m] of Object.entries(MODELS)) {
   const opt = document.createElement("option");
@@ -299,14 +309,13 @@ try { savedModel = localStorage.getItem("localai-model") || DEFAULT_MODEL; } cat
 if (!MODELS[savedModel]) savedModel = DEFAULT_MODEL;
 modelSelect.value = savedModel;
 
+function activeModelId() {
+  return customModelId || MODELS[modelSelect.value].id;
+}
+
 const worker = new Worker("./worker.js", { type: "module" });
 
 function fmtMB(bytes) { return (bytes / 1048576).toFixed(0) + " MB"; }
-
-function setLoading(on, title) {
-  loaderEl.hidden = !on;
-  if (title) $("loadTitle").textContent = title;
-}
 
 function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -342,37 +351,55 @@ function addBubble(role, text) {
   return bubble;
 }
 
+function setNote(text, warn) {
+  footNote.textContent = text ||
+    "Runs 100% locally in your browser · first use downloads the model once, then it's cached";
+  footNote.className = "foot-note" + (warn ? " warn" : "");
+}
+
 function updateUiState() {
-  sendBtn.disabled = !ready || generating || !inputEl.value.trim();
+  // Typing is ALWAYS possible; Send is available whenever there's text and
+  // nothing is currently generating — if the model isn't ready yet, the
+  // message queues and goes out automatically.
+  sendBtn.disabled = generating || !inputEl.value.trim();
   sendBtn.hidden = generating;
   stopBtn.hidden = !generating;
   modelSelect.disabled = generating;
 }
 
-function loadModel() {
-  ready = false;
-  setLoading(true, "Loading " + MODELS[modelSelect.value].label.split(" · ")[0] + "…");
+function showLoader(title) {
+  loaderEl.hidden = false;
+  $("loadTitle").textContent = title;
   $("barfill").style.width = "0%";
   $("loadPct").textContent = "0%";
   $("loadDetail").textContent = "Preparing… (cached models load instantly)";
   $("loadSize").textContent = "";
-  worker.postMessage({ type: "load", modelId: MODELS[modelSelect.value].id });
+  messagesEl.appendChild(loaderEl); // keep it below the newest messages
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function removeErrorCard() {
+  if (errorCard) { errorCard.remove(); errorCard = null; }
+}
+
+function loadModel() {
+  ready = false;
+  removeErrorCard();
+  const label = customModelId || MODELS[modelSelect.value].label.split(" · ")[0];
+  showLoader("Loading " + label + "…");
+  deviceChip.textContent = "starting…";
+  const opts = {};
+  if (hubOverride) opts.remoteHost = hubOverride;
+  worker.postMessage({ type: "load", modelId: activeModelId(), opts });
   updateUiState();
 }
 
-function send(text) {
-  const content = (text ?? inputEl.value).trim();
-  if (!content || !ready || generating) return;
-  inputEl.value = "";
-  inputEl.style.height = "auto";
-  addBubble("user", content);
-  history.push({ role: "user", content });
-
-  // Keep the prompt small for speed on modest hardware: system + recent turns.
+function startGeneration() {
   const recent = history.slice(-12);
   const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...recent];
-
   generating = true;
+  awaitingModel = false;
+  setNote(null);
   currentText = "";
   currentBubble = addBubble("bot", "");
   currentBubble.innerHTML = '<span class="cursor"></span>';
@@ -380,6 +407,100 @@ function send(text) {
   speedChip.textContent = "thinking…";
   updateUiState();
   worker.postMessage({ type: "generate", messages, params: {} });
+}
+
+function send(text) {
+  const content = (text ?? inputEl.value).trim();
+  if (!content || generating) return;
+  inputEl.value = "";
+  inputEl.style.height = "auto";
+  try { sessionStorage.removeItem("localai-draft"); } catch {}
+  addBubble("user", content);
+  history.push({ role: "user", content });
+  if (ready) {
+    startGeneration();
+  } else {
+    awaitingModel = true;
+    setNote("Model is still loading — your message will send automatically when it's ready.", true);
+    updateUiState();
+  }
+}
+
+function diagnose(failures, diag) {
+  const lines = [];
+  const hf = diag.huggingface;
+  if (hf && !hf.ok) {
+    if (hf.error) {
+      lines.push("This network appears to block huggingface.co, which hosts the model weights. " +
+        "Try a different network (for example a phone hotspot); after the one-time download the model is cached here.");
+    } else {
+      lines.push("huggingface.co answered HTTP " + hf.status + " for this model — the files may have moved. Try another model from the dropdown.");
+    }
+  }
+  if (diag.vendorWasm && !diag.vendorWasm.ok) {
+    if (diag.jsdelivr && diag.jsdelivr.ok) {
+      lines.push("This host isn't serving the app's runtime files; the CDN copy was used as a fallback.");
+    } else {
+      lines.push("Neither this host nor the CDN could provide the AI runtime files.");
+    }
+  }
+  const free = diag.storage && diag.storage.quota ? diag.storage.quota - (diag.storage.usage || 0) : null;
+  if (free !== null && free < 200 * 1048576) {
+    lines.push("Your browser has under 200 MB of storage available for caching — free up disk space, or pick the smallest model.");
+  }
+  if (!lines.length) {
+    const kinds = new Set(failures.map((f) => f.kind));
+    if (kinds.has("backend")) lines.push("The WebAssembly engine failed to start on this device.");
+    else if (kinds.has("missing-file")) lines.push("None of the model's quantized formats could be found — try another model.");
+    else lines.push("Model loading failed for an unrecognized reason — the technical details below may help.");
+  }
+  return lines;
+}
+
+function maybeSelfHeal(failures, diag) {
+  // If loading failed while cross-origin isolation was active (and the model
+  // host itself is reachable), retry once in single-threaded compatibility
+  // mode — the COI service worker is then the prime suspect.
+  const hfReachable = !diag.huggingface || diag.huggingface.ok;
+  const suspicious = failures.some((f) => f.kind === "backend" || f.kind === "unknown");
+  let alreadyOff = false;
+  try { alreadyOff = localStorage.getItem("localai-coi-off") === "1"; } catch {}
+  if (diag.crossOriginIsolated && hfReachable && suspicious && !alreadyOff) {
+    try { localStorage.setItem("localai-coi-off", "1"); } catch { return false; }
+    navigator.serviceWorker?.getRegistrations?.().then((regs) => {
+      Promise.all(regs.map((r) => r.unregister())).finally(() => location.reload());
+    }) || location.reload();
+    return true;
+  }
+  return false;
+}
+
+function showLoadError(failures, diag) {
+  loaderEl.hidden = true;
+  removeErrorCard();
+  const card = document.createElement("div");
+  card.className = "card error";
+  const lines = diagnose(failures, diag);
+  card.innerHTML =
+    "<h3>⚠️ The model couldn't load</h3><ul>" +
+    lines.map((l) => "<li>" + escapeHtml(l) + "</li>").join("") +
+    "</ul><details><summary>Technical details</summary><pre>" +
+    escapeHtml(JSON.stringify({ failures, diag }, null, 2)) +
+    "</pre></details>" +
+    '<div class="actions"><button class="primary" id="retryBtn">Retry</button>' +
+    '<button id="smallestBtn">Try smallest model</button></div>';
+  messagesEl.appendChild(card);
+  errorCard = card;
+  card.querySelector("#retryBtn").addEventListener("click", loadModel);
+  card.querySelector("#smallestBtn").addEventListener("click", () => {
+    modelSelect.value = "smollm2-135m";
+    try { localStorage.setItem("localai-model", "smollm2-135m"); } catch {}
+    loadModel();
+  });
+  heroEl.hidden = true;
+  chatEl.scrollTop = chatEl.scrollHeight;
+  deviceChip.textContent = "load failed";
+  setNote("Model loading failed — see the diagnosis above.", true);
 }
 
 worker.addEventListener("message", (e) => {
@@ -391,9 +512,7 @@ worker.addEventListener("message", (e) => {
         : "CPU · " + msg.threads + (msg.threads > 1 ? " threads" : " thread");
       deviceChip.textContent = label;
       deviceChip.className = "chip" + (msg.device === "webgpu" ? " ok" : "");
-      deviceChip.title = msg.note || (msg.device === "webgpu"
-        ? "Accelerated by your GPU"
-        : "Running on the CPU" + (msg.crossOriginIsolated ? "" : " (single-threaded — reload once to enable multithreading)"));
+      $("loadDetail").textContent = "Trying " + msg.attempt + "…";
       break;
     }
     case "progress": {
@@ -405,9 +524,23 @@ worker.addEventListener("message", (e) => {
     }
     case "ready": {
       ready = true;
-      setLoading(false);
+      loaderEl.hidden = true;
+      removeErrorCard();
       updateUiState();
-      inputEl.focus();
+      if (awaitingModel && history.length && history[history.length - 1].role === "user") {
+        startGeneration();
+      } else {
+        setNote(null);
+        inputEl.focus();
+      }
+      break;
+    }
+    case "load-failed": {
+      if (maybeSelfHeal(msg.failures, msg.diag)) {
+        $("loadTitle").textContent = "Retrying in compatibility mode…";
+        return;
+      }
+      showLoadError(msg.failures, msg.diag);
       break;
     }
     case "token": {
@@ -437,13 +570,12 @@ worker.addEventListener("message", (e) => {
       break;
     }
     case "error": {
-      setLoading(false);
+      loaderEl.hidden = true;
       if (currentBubble) {
         currentBubble.innerHTML = render("⚠️ " + msg.message);
         currentBubble = null;
       } else {
-        addBubble("bot", "⚠️ " + msg.message +
-          "\n\nIf this is the first load, check your internet connection and reload the page.");
+        addBubble("bot", "⚠️ " + msg.message);
       }
       generating = false;
       speedChip.hidden = true;
@@ -454,13 +586,13 @@ worker.addEventListener("message", (e) => {
 });
 
 worker.addEventListener("error", (e) => {
-  setLoading(false);
+  loaderEl.hidden = true;
   ready = false;
   generating = false;
   deviceChip.textContent = "engine failed";
   addBubble("bot",
     "⚠️ Couldn't start the AI engine" + (e.message ? ": " + e.message : "") +
-    "\n\nThe inference library loads from a CDN on first visit. Check your internet connection and reload the page — after the first successful load everything is cached.");
+    "\n\nReload the page to try again. If it keeps failing, the host may not be serving the app's files correctly.");
   updateUiState();
 });
 
@@ -468,18 +600,27 @@ sendBtn.addEventListener("click", () => send());
 stopBtn.addEventListener("click", () => worker.postMessage({ type: "stop" }));
 clearBtn.addEventListener("click", () => {
   history = [];
+  awaitingModel = false;
   messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
   heroEl.hidden = false;
+  setNote(null);
 });
 modelSelect.addEventListener("change", () => {
   try { localStorage.setItem("localai-model", modelSelect.value); } catch {}
+  awaitingModel = false;
   loadModel();
 });
 inputEl.addEventListener("input", () => {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+  try { sessionStorage.setItem("localai-draft", inputEl.value); } catch {}
   updateUiState();
 });
+try {
+  // Restore a draft typed just before the one-time isolation reload.
+  const draft = sessionStorage.getItem("localai-draft");
+  if (draft && !inputEl.value) { inputEl.value = draft; updateUiState(); }
+} catch {}
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -488,11 +629,7 @@ inputEl.addEventListener("keydown", (e) => {
 });
 heroEl.addEventListener("click", (e) => {
   const q = e.target?.dataset?.q;
-  if (q) {
-    inputEl.value = q;
-    updateUiState();
-    if (ready) send();
-  }
+  if (q) send(q);
 });
 
 loadModel();

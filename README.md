@@ -32,6 +32,23 @@ python3 -m http.server 8000
 (Opening `index.html` via `file://` won't work — browsers block workers and
 model downloads there.)
 
+## If the model won't load
+
+The app tries every backend and quantization it knows, and when all of them
+fail it shows a **diagnosis card** that pinpoints the cause — most commonly:
+
+- **Your network blocks `huggingface.co`** (typical on school/work networks).
+  The model weights live there; everything else ships with the app itself.
+  Load the page once on another network (a phone hotspot works) — the model
+  is then cached in the browser and later visits don't need the download.
+- **Not enough browser storage** to cache the model — free disk space or use
+  the smallest model.
+- **The engine failed on this device** — the app automatically retries once
+  in single-threaded compatibility mode.
+
+The card's *Technical details* section shows exactly what was attempted and
+what each probe found — paste it into an issue if you're stuck.
+
 ## Models
 
 All models are public, permissively licensed (Apache-2.0) open weights,
@@ -50,12 +67,15 @@ download.
 
 - **WebGPU acceleration** — on Chromebooks/browsers with WebGPU (Chrome 113+,
   most recent ChromeOS devices), inference runs on the GPU with 4-bit
-  fp16 weights (`q4f16`).
+  fp16 weights (`q4f16`), falling back through `q4` and the CPU formats until
+  one works.
 - **Multithreaded WASM fallback** — everywhere else it runs on the CPU using
-  all cores. A tiny service worker (`coi-serviceworker.js`) adds the
+  multiple cores. A tiny service worker (`coi-serviceworker.js`) adds the
   COOP/COEP headers GitHub Pages can't set, which unlocks
   `SharedArrayBuffer` and multithreading (one automatic reload on first visit).
-- **Aggressive quantization** — 4-bit weights on GPU, 8-bit on CPU.
+- **Self-hosted runtime** — the inference engine (`vendor/`) ships with the
+  app, so no CDN needs to be reachable; only the weights come from
+  Hugging Face, once.
 - **One-time download, permanent cache** — weights are stored in the browser's
   Cache Storage, so reopening the page does no re-downloading.
 - **Short prompt window** — the chat keeps a trimmed rolling history so
@@ -66,18 +86,38 @@ and live tokens/second while the model is talking.
 
 ## How it works
 
-Three files, zero build step:
+No build step:
 
-- **`index.html`** — the chat UI.
-- **`worker.js`** — a Web Worker that runs
+- **`index.html`** — the chat UI. You can always type; messages queue until
+  the model is ready.
+- **`worker.js`** — a Web Worker running
   [Transformers.js](https://huggingface.co/docs/transformers.js) (ONNX Runtime
-  Web under the hood) to load and run the model off the main thread, streaming
-  tokens back as they're generated.
+  Web under the hood). It walks a ladder of device/quantization combos
+  (WebGPU `q4f16` → `q4`, then CPU `q8` → `q4` → `uint8` → `int8`), streams
+  tokens back as they're generated, and runs network diagnostics if every
+  attempt fails.
 - **`coi-serviceworker.js`** — enables cross-origin isolation on static hosts
-  for multithreaded WASM.
+  for multithreaded WASM. If a load fails while isolation is on, the app
+  turns it off and retries in compatibility mode automatically.
+- **`vendor/`** — the pinned transformers.js bundle and ONNX wasm runtime
+  (from npm, `@huggingface/transformers@3.8.1`), so the app doesn't depend on
+  any CDN being reachable.
 
 `.github/workflows/deploy.yml` publishes the page to GitHub Pages on every
 push.
+
+## Testing
+
+The repo contains a real end-to-end test that needs no network: a ~300 KB
+random-weight llama-shaped ONNX model (`test/fixtures/tiny-llm`, regenerable
+with `python3 test/make-fixture.py`) exercises the entire stack — tokenizer,
+chat template, KV cache, multithreaded WASM inference, streaming — in headless
+Chromium, plus the offline-diagnosis path:
+
+```bash
+npm install
+npm test          # runs test/e2e.mjs against a local Chromium
+```
 
 ## Privacy
 
