@@ -40,11 +40,16 @@ function classify(err) {
     m.includes("rangeerror")
   )
     return "memory";
+  if (m.includes("simd")) return "simd"; // pre-2021 Chrome, e.g. post-AUE Chromebooks
   if (m.includes("no available backend")) return "backend";
   if (m.includes("could not locate file") || m.includes("404")) return "missing-file";
+  if (m.includes("forbidden access to file")) return "blocked-http"; // filtering proxy answering 403
+  // A filtering proxy serving a 200 HTML block page instead of model files:
+  if (m.includes("unexpected token") || m.includes("not valid json") || m.includes("protobuf parsing failed"))
+    return "corrupted";
   if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))
     return "network";
-  if (m.includes("quota") || m.includes("storage")) return "storage";
+  if (m.includes("quota") || m.includes("storage") || m.includes("browser cache is not available")) return "storage";
   if (m.includes("webgpu") || m.includes("adapter")) return "webgpu";
   return "unknown";
 }
@@ -110,13 +115,37 @@ async function probeUrl(url) {
   }
 }
 
+// GET + parse: a filtering proxy can answer 200 with an HTML block page, so a
+// status check alone would lie — verify the body is the JSON it claims to be.
+async function probeJson(url) {
+  try {
+    const r = await fetch(url, { cache: "no-store" });
+    const out = { ok: r.ok, status: r.status };
+    if (r.ok) {
+      const text = await r.text();
+      try {
+        JSON.parse(text);
+        out.validJson = true;
+      } catch {
+        out.validJson = false;
+        out.snippet = text.slice(0, 80);
+      }
+    }
+    return out;
+  } catch (e) {
+    return { ok: false, error: errText(e) };
+  }
+}
+
 async function runDiagnostics(modelId) {
   const diag = {
     crossOriginIsolated: !!globalThis.crossOriginIsolated,
     threads: navigator.hardwareConcurrency || 1,
     userAgent: navigator.userAgent,
   };
-  diag.huggingface = await probeUrl(`https://huggingface.co/${modelId}/resolve/main/config.json`);
+  diag.huggingface = await probeJson(
+    (env.remoteHost || "https://huggingface.co/") + `${modelId}/resolve/main/config.json`
+  );
   diag.vendorWasm = await probeUrl(VENDOR_URL + "ort-wasm-simd-threaded.jsep.wasm");
   diag.jsdelivr = await probeUrl("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/package.json");
   try {
@@ -135,6 +164,11 @@ async function runDiagnostics(modelId) {
 
 async function load(modelId, opts = {}) {
   if (opts.remoteHost) env.remoteHost = opts.remoteHost; // test hook
+  // Page-controlled recovery options. These must be applied in a FRESH worker:
+  // onnxruntime latches a failed wasm init, so the page respawns this worker
+  // and passes the adjusted configuration instead of retrying in place.
+  if (opts.numThreads) env.backends.onnx.wasm.numThreads = opts.numThreads;
+  if (opts.wasmSource === "cdn") env.backends.onnx.wasm.wasmPaths = CDN_DIST;
 
   if (generator && loadedModelId === modelId) {
     self.postMessage({ type: "ready", modelId });
@@ -150,10 +184,8 @@ async function load(modelId, opts = {}) {
 
   const attempts = await buildAttempts();
   const failures = [];
-  let wasmFromCdn = false;
 
-  for (let i = 0; i < attempts.length; i++) {
-    const a = attempts[i];
+  for (const a of attempts) {
     const label =
       (a.device === "webgpu" ? "GPU" : "CPU") + " · " + a.dtype;
     self.postMessage({
@@ -162,9 +194,11 @@ async function load(modelId, opts = {}) {
       dtype: a.dtype,
       // Mirrors onnxruntime-web's own choice: min(4, ceil(cores/2)) when
       // cross-origin isolated, else single-threaded.
-      threads: globalThis.crossOriginIsolated
-        ? Math.min(4, Math.ceil((navigator.hardwareConcurrency || 1) / 2))
-        : 1,
+      threads: opts.numThreads
+        ? opts.numThreads
+        : globalThis.crossOriginIsolated
+          ? Math.min(4, Math.ceil((navigator.hardwareConcurrency || 1) / 2))
+          : 1,
       crossOriginIsolated: !!globalThis.crossOriginIsolated,
       attempt: label,
     });
@@ -181,17 +215,10 @@ async function load(modelId, opts = {}) {
       const kind = classify(err);
       failures.push({ device: a.device, dtype: a.dtype, kind, message: errText(err) });
 
-      if (kind === "backend" && !wasmFromCdn) {
-        // The wasm runtime itself failed to load from this host — retry the
-        // same attempt once with the CDN copy before moving down the ladder.
-        env.backends.onnx.wasm.wasmPaths = CDN_DIST;
-        wasmFromCdn = true;
-        i--;
-        continue;
-      }
-      if (kind === "network") {
-        // The model host is unreachable; every other attempt needs the same
-        // downloads, so stop early instead of hammering a dead network.
+      if (kind === "network" || kind === "corrupted") {
+        // The model host is unreachable (or a filter is tampering with its
+        // responses); every other attempt needs the same downloads, so stop
+        // early instead of hammering a dead or hostile network.
         break;
       }
       if (kind === "memory" && a.device === "wasm") {
@@ -199,7 +226,7 @@ async function load(modelId, opts = {}) {
         // model is the only real fix, so don't burn RAM on more attempts.
         break;
       }
-      // missing-file / webgpu / unknown → try the next device+dtype combo.
+      // missing-file / webgpu / backend / unknown → try the next combo.
     }
   }
 

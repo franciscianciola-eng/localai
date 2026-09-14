@@ -313,7 +313,18 @@ function activeModelId() {
   return customModelId || MODELS[modelSelect.value].id;
 }
 
-const worker = new Worker("./worker.js", { type: "module" });
+// The worker is respawned during recovery: onnxruntime latches a failed wasm
+// init inside a worker, so retrying with different settings needs a fresh one.
+let worker = null;
+const workerOpts = {}; // numThreads / wasmSource, applied on every (re)spawn
+const recovery = { cacheCleared: false, singleThread: false, cdnWasm: false };
+
+function spawnWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker("./worker.js", { type: "module" });
+  worker.addEventListener("message", handleWorkerMessage);
+  worker.addEventListener("error", handleWorkerError);
+}
 
 function fmtMB(bytes) { return (bytes / 1048576).toFixed(0) + " MB"; }
 
@@ -388,8 +399,9 @@ function loadModel() {
   const label = customModelId || MODELS[modelSelect.value].label.split(" · ")[0];
   showLoader("Loading " + label + "…");
   deviceChip.textContent = "starting…";
-  const opts = {};
+  const opts = { ...workerOpts };
   if (hubOverride) opts.remoteHost = hubOverride;
+  if (!worker) spawnWorker();
   worker.postMessage({ type: "load", modelId: activeModelId(), opts });
   updateUiState();
 }
@@ -428,14 +440,27 @@ function send(text) {
 
 function diagnose(failures, diag) {
   const lines = [];
+  const kinds = new Set(failures.map((f) => f.kind));
   const hf = diag.huggingface;
   if (hf && !hf.ok) {
     if (hf.error) {
       lines.push("This network appears to block huggingface.co, which hosts the model weights. " +
         "Try a different network (for example a phone hotspot); after the one-time download the model is cached here.");
+    } else if (hf.status === 403) {
+      lines.push("huggingface.co answered 'Forbidden' — a network filter or policy is likely blocking model downloads here. Try a different network.");
     } else {
       lines.push("huggingface.co answered HTTP " + hf.status + " for this model — the files may have moved. Try another model from the dropdown.");
     }
+  } else if (hf && hf.ok && hf.validJson === false) {
+    lines.push("A network filter on this connection intercepts huggingface.co and serves a block page instead of the model files. " +
+      "Cached downloads were cleared automatically — retry on an unfiltered network (a phone hotspot works).");
+  }
+  if (kinds.has("blocked-http")) {
+    lines.push("Model file downloads were answered with 'Forbidden' — that's a network policy, not a problem with the model.");
+  }
+  if (kinds.has("simd")) {
+    lines.push("This device's Chrome is too old for modern WebAssembly (needs roughly Chrome 91+, 2021). " +
+      "If this Chromebook is past its update expiration date, it unfortunately can't run in-browser AI.");
   }
   if (diag.vendorWasm && !diag.vendorWasm.ok) {
     if (diag.jsdelivr && diag.jsdelivr.ok) {
@@ -449,7 +474,6 @@ function diagnose(failures, diag) {
     lines.push("Your browser has under 200 MB of storage available for caching — free up disk space, or pick the smallest model.");
   }
   if (!lines.length) {
-    const kinds = new Set(failures.map((f) => f.kind));
     if (kinds.has("memory")) lines.push("This device ran out of memory while starting the model — the smallest model (SmolLM2 135M) needs far less RAM.");
     else if (kinds.has("backend")) lines.push("The WebAssembly engine failed to start on this device.");
     else if (kinds.has("missing-file")) lines.push("None of the model's quantized formats could be found — try another model.");
@@ -486,7 +510,7 @@ function showLoadError(failures, diag) {
     "<h3>⚠️ The model couldn't load</h3><ul>" +
     lines.map((l) => "<li>" + escapeHtml(l) + "</li>").join("") +
     "</ul><details><summary>Technical details</summary><pre>" +
-    escapeHtml(JSON.stringify({ failures, diag }, null, 2)) +
+    escapeHtml(JSON.stringify({ failures, diag, recovery }, null, 2)) +
     "</pre></details>" +
     '<div class="actions"><button class="primary" id="retryBtn">Retry</button>' +
     '<button id="smallestBtn">Try smallest model</button></div>';
@@ -504,7 +528,40 @@ function showLoadError(failures, diag) {
   setNote("Model loading failed — see the diagnosis above.", true);
 }
 
-worker.addEventListener("message", (e) => {
+// Staged recovery: each stage adjusts one variable and retries in a fresh
+// worker (onnxruntime latches a failed wasm init, so in-place retries can't
+// work). Order: poisoned cache → threading → runtime source → drop isolation.
+async function attemptRecovery(failures, diag) {
+  const kinds = new Set(failures.map((f) => f.kind));
+  const retry = (title) => {
+    spawnWorker();
+    loadModel();
+    $("loadTitle").textContent = title;
+  };
+
+  if (kinds.has("corrupted") && !recovery.cacheCleared) {
+    recovery.cacheCleared = true;
+    try { await caches.delete("transformers-cache"); } catch {}
+    return retry("Cleared cached downloads — retrying…");
+  }
+  if ((kinds.has("backend") || kinds.has("unknown")) && diag.crossOriginIsolated && !recovery.singleThread) {
+    recovery.singleThread = true;
+    workerOpts.numThreads = 1;
+    return retry("Retrying single-threaded…");
+  }
+  if (kinds.has("backend") && diag.vendorWasm && !diag.vendorWasm.ok && !recovery.cdnWasm) {
+    recovery.cdnWasm = true;
+    workerOpts.wasmSource = "cdn";
+    return retry("Retrying with the CDN runtime…");
+  }
+  if (maybeSelfHeal(failures, diag)) {
+    $("loadTitle").textContent = "Retrying in compatibility mode…";
+    return;
+  }
+  showLoadError(failures, diag);
+}
+
+function handleWorkerMessage(e) {
   const msg = e.data;
   switch (msg.type) {
     case "device": {
@@ -537,11 +594,7 @@ worker.addEventListener("message", (e) => {
       break;
     }
     case "load-failed": {
-      if (maybeSelfHeal(msg.failures, msg.diag)) {
-        $("loadTitle").textContent = "Retrying in compatibility mode…";
-        return;
-      }
-      showLoadError(msg.failures, msg.diag);
+      attemptRecovery(msg.failures, msg.diag);
       break;
     }
     case "token": {
@@ -584,9 +637,9 @@ worker.addEventListener("message", (e) => {
       break;
     }
   }
-});
+}
 
-worker.addEventListener("error", (e) => {
+function handleWorkerError(e) {
   loaderEl.hidden = true;
   ready = false;
   generating = false;
@@ -595,7 +648,7 @@ worker.addEventListener("error", (e) => {
     "⚠️ Couldn't start the AI engine" + (e.message ? ": " + e.message : "") +
     "\n\nReload the page to try again. If it keeps failing, the host may not be serving the app's files correctly.");
   updateUiState();
-});
+}
 
 sendBtn.addEventListener("click", () => send());
 stopBtn.addEventListener("click", () => worker.postMessage({ type: "stop" }));

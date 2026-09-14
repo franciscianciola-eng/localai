@@ -23,6 +23,12 @@ const server = http.createServer(async (req, res) => {
   let p = decodeURIComponent(req.url.split("?")[0]);
   if (p === "/") p = "/index.html";
   // Fake Hugging Face hub: /hub/<model>/resolve/<rev>/<file> -> test/fixtures/<model>/<file>
+  // Simulated school filter: answers every model-file request with an HTML
+  // block page and HTTP 200 (the cache-poisoning worst case).
+  if (p.startsWith("/hubblock/")) {
+    res.writeHead(200, { "content-type": "text/html", "access-control-allow-origin": "*" });
+    return res.end("<!DOCTYPE html><html><body>Blocked by NetFilter</body></html>");
+  }
   const hub = p.match(/^\/hub\/([^/]+)\/resolve\/[^/]+\/(.+)$/);
   const file = hub
     ? path.join(root, "test", "fixtures", hub[1], hub[2])
@@ -119,6 +125,26 @@ const check = (name, cond, extra = "") => {
     check("send button enabled with text", !(await page.isDisabled("#sendBtn")));
   }
   await page.screenshot({ path: "/tmp/claude-0/-home-user-localai/1195d466-a8fe-5a3e-93e1-f9839c588b96/scratchpad/e2e-error.png" }).catch(() => {});
+  await page.close();
+}
+
+// ---------- Test 3: filter serving a 200 HTML block page -> detected ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await page.goto(
+    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hubblock/`,
+    { waitUntil: "load" }
+  );
+  const cardShown = await page
+    .waitForSelector(".card.error", { timeout: 60000 })
+    .then(() => true)
+    .catch(() => false);
+  check("error card appears for HTML block page", cardShown);
+  if (cardShown) {
+    const text = await page.textContent(".card.error");
+    check("diagnosis identifies the block page", /block page/.test(text), text.slice(0, 250));
+    check("cache-clear retry was attempted", /"cacheCleared":\s*true/.test(text));
+  }
   await page.close();
 }
 

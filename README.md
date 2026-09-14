@@ -41,6 +41,8 @@ fail it shows a **diagnosis card** that pinpoints the cause — most commonly:
   The model weights live there; everything else ships with the app itself.
   Load the page once on another network (a phone hotspot works) — the model
   is then cached in the browser and later visits don't need the download.
+  Filters that serve an HTML "blocked" page instead of the real files are
+  detected too, and the poisoned download cache is cleared automatically.
 - **Not enough browser storage** to cache the model — free disk space or use
   the smallest model.
 - **The engine failed on this device** — the app automatically retries once
