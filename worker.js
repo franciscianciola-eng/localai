@@ -44,6 +44,9 @@ function classify(err) {
   if (m.includes("no available backend")) return "backend";
   if (m.includes("could not locate file") || m.includes("404")) return "missing-file";
   if (m.includes("forbidden access to file")) return "blocked-http"; // filtering proxy answering 403
+  // transformers.js maps HTTP 5xx to "... error occurred while trying to load
+  // file" — a (usually transient) server-side problem, not a device problem.
+  if (m.includes("occurred while trying to load file")) return "network";
   // A filtering proxy serving a 200 HTML block page instead of model files:
   if (m.includes("unexpected token") || m.includes("not valid json") || m.includes("protobuf parsing failed"))
     return "corrupted";

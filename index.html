@@ -297,6 +297,15 @@ let awaitingModel = false; // a user message is queued for when the model is rea
 let currentBubble = null;
 let currentText = "";
 let errorCard = null;
+let engineDead = false;
+
+// The conversation survives app-initiated reloads (the first-visit isolation
+// reload and compatibility-mode recovery) via per-tab sessionStorage.
+function saveConvo() {
+  try {
+    sessionStorage.setItem("localai-convo", JSON.stringify({ history, awaitingModel }));
+  } catch {}
+}
 
 for (const [key, m] of Object.entries(MODELS)) {
   const opt = document.createElement("option");
@@ -321,6 +330,7 @@ const recovery = { cacheCleared: false, singleThread: false, cdnWasm: false };
 
 function spawnWorker() {
   if (worker) worker.terminate();
+  engineDead = false;
   worker = new Worker("./worker.js", { type: "module" });
   worker.addEventListener("message", handleWorkerMessage);
   worker.addEventListener("error", handleWorkerError);
@@ -434,9 +444,12 @@ function send(text) {
     startGeneration();
   } else {
     awaitingModel = true;
-    setNote("Model is still loading — your message will send automatically when it's ready.", true);
+    setNote(engineDead
+      ? "The AI engine failed — reload the page to send this message."
+      : "Model is still loading — your message will send automatically when it's ready.", true);
     updateUiState();
   }
+  saveConvo();
 }
 
 function diagnose(failures, diag) {
@@ -463,6 +476,9 @@ function diagnose(failures, diag) {
     lines.push("This device's Chrome is too old for modern WebAssembly (needs roughly Chrome 91+, 2021). " +
       "If this Chromebook is past its update expiration date, it unfortunately can't run in-browser AI.");
   }
+  if (kinds.has("network") && hf && hf.ok && hf.validJson !== false) {
+    lines.push("The model host answered errors while downloading files — often a temporary outage. Hit Retry in a minute.");
+  }
   if (diag.vendorWasm && !diag.vendorWasm.ok) {
     if (diag.jsdelivr && diag.jsdelivr.ok) {
       lines.push("This host isn't serving the app's runtime files; the CDN copy was used as a fallback.");
@@ -486,9 +502,12 @@ function diagnose(failures, diag) {
 function maybeSelfHeal(failures, diag) {
   // If loading failed while cross-origin isolation was active (and the model
   // host itself is reachable), retry once in single-threaded compatibility
-  // mode — the COI service worker is then the prime suspect.
+  // mode — the COI service worker is then the prime suspect. Only failures on
+  // the wasm path implicate it; a WebGPU failure says nothing about COI.
   const hfReachable = !diag.huggingface || diag.huggingface.ok;
-  const suspicious = failures.some((f) => f.kind === "backend" || f.kind === "unknown");
+  const suspicious = failures.some(
+    (f) => f.device === "wasm" && (f.kind === "backend" || f.kind === "unknown")
+  );
   let alreadyOff = false;
   try { alreadyOff = localStorage.getItem("localai-coi-off") === "1"; } catch {}
   if (diag.crossOriginIsolated && hfReachable && suspicious && !alreadyOff) {
@@ -590,6 +609,8 @@ function handleWorkerMessage(e) {
       ready = true;
       loaderEl.hidden = true;
       removeErrorCard();
+      // A later cache poisoning should get its own automatic clear-and-retry.
+      recovery.cacheCleared = false;
       updateUiState();
       if (awaitingModel && history.length && history[history.length - 1].role === "user") {
         startGeneration();
@@ -622,6 +643,7 @@ function handleWorkerMessage(e) {
         currentBubble.appendChild(meta);
       }
       history.push({ role: "assistant", content: finalText });
+      saveConvo();
       generating = false;
       currentBubble = null;
       speedChip.hidden = true;
@@ -649,7 +671,9 @@ function handleWorkerError(e) {
   loaderEl.hidden = true;
   ready = false;
   generating = false;
+  engineDead = true;
   awaitingModel = false;
+  saveConvo();
   speedChip.hidden = true;
   if (currentBubble) {
     currentBubble.innerHTML = render("⚠️ The AI engine crashed mid-reply.");
@@ -668,6 +692,7 @@ stopBtn.addEventListener("click", () => worker.postMessage({ type: "stop" }));
 clearBtn.addEventListener("click", () => {
   history = [];
   awaitingModel = false;
+  saveConvo();
   messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
   heroEl.hidden = false;
   setNote(null);
@@ -690,6 +715,20 @@ try {
   // Restore a draft typed just before the one-time isolation reload.
   const draft = sessionStorage.getItem("localai-draft");
   if (draft && !inputEl.value) { inputEl.value = draft; updateUiState(); }
+} catch {}
+try {
+  // Restore the conversation across app-initiated reloads (isolation setup,
+  // compatibility-mode recovery). A queued message stays queued: the ready
+  // handler answers it once the model loads.
+  const saved = JSON.parse(sessionStorage.getItem("localai-convo") || "null");
+  if (saved && Array.isArray(saved.history) && saved.history.length) {
+    history = saved.history;
+    for (const m of history) addBubble(m.role, m.content);
+    if (saved.awaitingModel && history[history.length - 1]?.role === "user") {
+      awaitingModel = true;
+      setNote("Model is still loading — your message will send automatically when it's ready.", true);
+    }
+  }
 } catch {}
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {

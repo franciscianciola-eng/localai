@@ -124,5 +124,6 @@ npm test          # runs test/e2e.mjs against a local Chromium
 ## Privacy
 
 After the one-time model download from Hugging Face's public CDN, all
-inference happens in your browser tab. Conversations are kept in memory only —
-close the tab and they're gone. Nothing is logged or transmitted anywhere.
+inference happens in your browser tab. Conversations live only in the tab
+(they survive a refresh, and vanish when the tab closes). Nothing is logged
+or transmitted anywhere.
