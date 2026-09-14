@@ -450,7 +450,8 @@ function diagnose(failures, diag) {
   }
   if (!lines.length) {
     const kinds = new Set(failures.map((f) => f.kind));
-    if (kinds.has("backend")) lines.push("The WebAssembly engine failed to start on this device.");
+    if (kinds.has("memory")) lines.push("This device ran out of memory while starting the model — the smallest model (SmolLM2 135M) needs far less RAM.");
+    else if (kinds.has("backend")) lines.push("The WebAssembly engine failed to start on this device.");
     else if (kinds.has("missing-file")) lines.push("None of the model's quantized formats could be found — try another model.");
     else lines.push("Model loading failed for an unrecognized reason — the technical details below may help.");
   }

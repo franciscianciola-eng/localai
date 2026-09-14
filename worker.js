@@ -30,6 +30,16 @@ function errText(err) {
 // attempt in the ladder could still succeed.
 function classify(err) {
   const m = errText(err).toLowerCase();
+  // Memory first: wasm OOM surfaces as "no available backend ... RangeError:
+  // Out of memory" on low-RAM devices, which must not read as a backend bug.
+  if (
+    m.includes("out of memory") ||
+    m.includes("bad_alloc") ||
+    m.includes("allocation failed") ||
+    m.includes("cannot enlarge memory") ||
+    m.includes("rangeerror")
+  )
+    return "memory";
   if (m.includes("no available backend")) return "backend";
   if (m.includes("could not locate file") || m.includes("404")) return "missing-file";
   if (m.includes("failed to fetch") || m.includes("networkerror") || m.includes("network error") || m.includes("load failed"))
@@ -182,6 +192,11 @@ async function load(modelId, opts = {}) {
       if (kind === "network") {
         // The model host is unreachable; every other attempt needs the same
         // downloads, so stop early instead of hammering a dead network.
+        break;
+      }
+      if (kind === "memory" && a.device === "wasm") {
+        // Every CPU variant of this model is roughly the same size; a smaller
+        // model is the only real fix, so don't burn RAM on more attempts.
         break;
       }
       // missing-file / webgpu / unknown → try the next device+dtype combo.
