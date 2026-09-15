@@ -29,9 +29,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "text/html", "access-control-allow-origin": "*" });
     return res.end("<!DOCTYPE html><html><body>Blocked by NetFilter</body></html>");
   }
-  const hub = p.match(/^\/hub\/([^/]+)\/resolve\/[^/]+\/(.+)$/);
+  // Fake hub serves the tiny fixture for ANY requested model id, so tests can
+  // exercise the app's real model registry (step-down, defaults) offline.
+  const hub = p.match(/^\/hub\/(.+?)\/resolve\/[^/]+\/(.+)$/);
   const file = hub
-    ? path.join(root, "test", "fixtures", hub[1], hub[2])
+    ? path.join(root, "test", "fixtures", "tiny-llm", hub[2])
     : path.join(root, p);
   if (!file.startsWith(root)) { res.writeHead(403); return res.end(); }
   try {
@@ -153,7 +155,40 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
-// ---------- Test 4: filter serving a 200 HTML block page -> detected ----------
+// ---------- Test 4: heavy model crashes at load -> auto step-down to smaller ----------
+{
+  const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await context.addInitScript(() => {
+    try { localStorage.setItem("localai-model", "smollm2-360m"); } catch {}
+  });
+  const page = await context.newPage();
+  await page.goto(
+    `http://localhost:${PORT}/?hub=http://localhost:${PORT}/hub/&crashload=1`,
+    { waitUntil: "load" }
+  );
+  // Every load attempt for the selected 360M model crashes (test hook); the
+  // app should step down to 135M automatically and load it successfully.
+  const ready = await page
+    .waitForFunction(() =>
+      document.getElementById("modelSelect").value === "smollm2-135m" &&
+      document.getElementById("loader").hidden &&
+      !document.querySelector(".card.error"), { timeout: 90000 })
+    .then(() => true)
+    .catch(() => false);
+  check("app steps down to the smallest model and loads it", ready);
+  if (ready) {
+    await page.fill("#input", "Does the smaller model talk?");
+    await page.click("#sendBtn");
+    const replied = await page
+      .waitForSelector(".msg.bot .bubble .meta", { timeout: 60000 })
+      .then(() => true)
+      .catch(() => false);
+    check("stepped-down model generates a reply", replied);
+  }
+  await context.close();
+}
+
+// ---------- Test 5: filter serving a 200 HTML block page -> detected ----------
 {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   await page.goto(

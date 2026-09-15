@@ -73,12 +73,11 @@ async function buildAttempts(opts = {}) {
     if (adapter.features?.has?.("shader-f16")) attempts.push({ device: "webgpu", dtype: "q4f16" });
     attempts.push({ device: "webgpu", dtype: "q4" });
   }
-  // CPU path: q8 (a.k.a. model_quantized) is the best-supported wasm dtype;
-  // the rest are fallbacks in case a repo lacks a particular file.
+  // CPU path: q8 (a.k.a. model_quantized) is the best-supported wasm dtype,
+  // with q4 as the one fallback — more variants would mean more multi-hundred
+  // MB downloads for near-identical odds; a smaller model is the real fix.
   attempts.push({ device: "wasm", dtype: "q8" });
   attempts.push({ device: "wasm", dtype: "q4" });
-  attempts.push({ device: "wasm", dtype: "uint8" });
-  attempts.push({ device: "wasm", dtype: "int8" });
   return attempts;
 }
 
@@ -213,6 +212,7 @@ async function load(modelId, opts = {}) {
       attempt: label,
     });
     try {
+      if (opts.testCrashLoad) throw 576720528; // test hook: emulate load crash
       generator = await pipeline("text-generation", modelId, {
         device: a.device,
         dtype: a.dtype,

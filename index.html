@@ -253,10 +253,11 @@
 </footer>
 
 <script type="module">
+const APP_VERSION = "v6"; // bump on every push — shown in the footer
 const MODELS = {
   "smollm2-135m": {
     id: "onnx-community/SmolLM2-135M-Instruct-ONNX",
-    label: "SmolLM2 135M · fastest (~0.1 GB)",
+    label: "SmolLM2 135M · fastest, runs anywhere (~0.1 GB)",
   },
   "smollm2-360m": {
     id: "onnx-community/SmolLM2-360M-Instruct-ONNX",
@@ -267,7 +268,9 @@ const MODELS = {
     label: "Qwen2.5 0.5B · smartest (~0.5 GB)",
   },
 };
-const DEFAULT_MODEL = "smollm2-360m";
+// Heaviest → lightest, for automatic step-down when a model won't run.
+const MODEL_ORDER = ["qwen25-05b", "smollm2-360m", "smollm2-135m"];
+const DEFAULT_MODEL = "smollm2-135m";
 const SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
@@ -333,6 +336,7 @@ try {
   if (localStorage.getItem("localai-force-wasm") === "1") workerOpts.forceWasm = true;
 } catch {}
 if (params.get("crashgen")) workerOpts.testCrashGenerate = true; // test hook
+if (params.get("crashload")) workerOpts.testCrashLoad = true;    // test hook
 
 function spawnWorker() {
   if (worker) worker.terminate();
@@ -379,8 +383,9 @@ function addBubble(role, text) {
 }
 
 function setNote(text, warn) {
-  footNote.textContent = text ||
-    "Runs 100% locally in your browser · first use downloads the model once, then it's cached";
+  footNote.textContent = (text ||
+    "Runs 100% locally in your browser · first use downloads the model once, then it's cached") +
+    " · " + APP_VERSION;
   footNote.className = "foot-note" + (warn ? " warn" : "");
 }
 
@@ -543,7 +548,9 @@ function showLoadError(failures, diag) {
     escapeHtml(JSON.stringify({ failures, diag, recovery }, null, 2)) +
     "</pre></details>" +
     '<div class="actions"><button class="primary" id="retryBtn">Retry</button>' +
-    '<button id="smallestBtn">Try smallest model</button></div>';
+    '<button id="smallestBtn">Try smallest model</button>' +
+    '<button id="copyBtn">Copy details</button>' +
+    '<button id="resetBtn">Reset app</button></div>';
   messagesEl.appendChild(card);
   errorCard = card;
   // Respawn on retry: a failed wasm init is latched for the worker's lifetime.
@@ -556,6 +563,29 @@ function showLoadError(failures, diag) {
     try { localStorage.setItem("localai-model", "smollm2-135m"); } catch {}
     spawnWorker();
     loadModel();
+  });
+  card.querySelector("#resetBtn").addEventListener("click", async () => {
+    // Clean slate: drop every stored flag, cached download, and the service
+    // worker, then start over as if this were the first visit.
+    try {
+      localStorage.removeItem("localai-coi-off");
+      localStorage.removeItem("localai-force-wasm");
+      localStorage.removeItem("localai-model");
+    } catch {}
+    try { sessionStorage.clear(); } catch {}
+    try { await caches.delete("transformers-cache"); } catch {}
+    try {
+      const regs = await navigator.serviceWorker?.getRegistrations?.();
+      if (regs) await Promise.all(regs.map((r) => r.unregister()));
+    } catch {}
+    location.reload();
+  });
+  card.querySelector("#copyBtn").addEventListener("click", (ev) => {
+    const payload = "LocalAI " + APP_VERSION + "\n" + JSON.stringify({ failures, diag, recovery }, null, 2);
+    navigator.clipboard?.writeText(payload).then(
+      () => { ev.target.textContent = "Copied!"; },
+      () => { ev.target.textContent = "Copy failed — open Technical details"; }
+    );
   });
   heroEl.hidden = true;
   chatEl.scrollTop = chatEl.scrollHeight;
@@ -588,6 +618,21 @@ async function attemptRecovery(failures, diag) {
     recovery.cdnWasm = true;
     workerOpts.wasmSource = "cdn";
     return retry("Retrying with the CDN runtime…");
+  }
+  // Too heavy for this device (out of memory, or the engine crashed on it):
+  // automatically step down to the next smaller model until one runs.
+  if ((kinds.has("memory") || kinds.has("engine-crash")) && !customModelId) {
+    const idx = MODEL_ORDER.indexOf(modelSelect.value);
+    const smaller = idx >= 0 ? MODEL_ORDER[idx + 1] : null;
+    if (smaller) {
+      modelSelect.value = smaller;
+      try { localStorage.setItem("localai-model", smaller); } catch {}
+      delete workerOpts.testCrashLoad;
+      retry("This model is too heavy for this device — trying " +
+        MODELS[smaller].label.split(" · ")[0] + " instead…");
+      setNote("Switched to a smaller model that fits this device.", true);
+      return;
+    }
   }
   if (maybeSelfHeal(failures, diag)) {
     $("loadTitle").textContent = "Retrying in compatibility mode…";
@@ -711,14 +756,27 @@ function handleWorkerError(e) {
   loaderEl.hidden = true;
   ready = false;
   generating = false;
+  speedChip.hidden = true;
+  if (currentBubble) {
+    currentBubble.parentElement?.remove();
+    currentBubble = null;
+  }
+  // A whole-worker crash (an async engine failure no promise caught): recover
+  // once automatically on the safest settings instead of dead-ending.
+  if (!recovery.workerCrashRetried) {
+    recovery.workerCrashRetried = true;
+    workerOpts.forceWasm = true;
+    workerOpts.numThreads = 1;
+    delete workerOpts.testCrashGenerate;
+    delete workerOpts.testCrashLoad;
+    spawnWorker();
+    loadModel();
+    $("loadTitle").textContent = "The engine crashed — restarting in a safer mode…";
+    return;
+  }
   engineDead = true;
   awaitingModel = false;
   saveConvo();
-  speedChip.hidden = true;
-  if (currentBubble) {
-    currentBubble.innerHTML = render("⚠️ The AI engine crashed mid-reply.");
-    currentBubble = null;
-  }
   deviceChip.textContent = "engine failed";
   addBubble("bot",
     "⚠️ Couldn't start the AI engine" + (e.message ? ": " + e.message : "") +
@@ -781,6 +839,8 @@ heroEl.addEventListener("click", (e) => {
   if (q) send(q);
 });
 
+console.log("LocalAI " + APP_VERSION);
+setNote(null);
 loadModel();
 </script>
 </body>

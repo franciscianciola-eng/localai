@@ -45,8 +45,12 @@ fail it shows a **diagnosis card** that pinpoints the cause — most commonly:
   detected too, and the poisoned download cache is cleared automatically.
 - **Not enough browser storage** to cache the model — free disk space or use
   the smallest model.
-- **The engine failed on this device** — the app automatically retries once
-  in single-threaded compatibility mode.
+- **The model is too heavy for this device** — the app automatically steps
+  down to the next smaller model until one runs.
+- **The engine failed or crashed on this device** — the app automatically
+  retries on safer settings (CPU instead of GPU, single-threaded), and the
+  error card has a **Reset app** button that wipes all stored state for a
+  clean start.
 
 The card's *Technical details* section shows exactly what was attempted and
 what each probe found — paste it into an issue if you're stuck.
@@ -58,8 +62,8 @@ downloaded directly from Hugging Face and quantized to 4/8-bit ONNX for speed:
 
 | Model | Download | Best for |
 |---|---|---|
-| [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | ~0.1 GB | Oldest / slowest Chromebooks |
-| [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) *(default)* | ~0.3 GB | Best speed/coherence balance |
+| [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) *(default)* | ~0.1 GB | Runs on anything — the safe default |
+| [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~0.3 GB | Best speed/coherence balance |
 | [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~0.5 GB | Smartest answers |
 
 Switch models from the dropdown in the header; each is cached after its first
