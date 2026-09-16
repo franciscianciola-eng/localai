@@ -3,9 +3,10 @@
 // network use is downloading the public model weights once (then cached).
 //
 // The transformers.js bundle and the ONNX wasm runtime are vendored into this
-// repo (vendor/), so the only external host the app needs is huggingface.co
-// for the weights themselves. If the vendored wasm can't be served by the
-// current host, we retry from the jsdelivr CDN.
+// repo (vendor/). Some static hosts (e.g. raw.githack) refuse to serve the
+// 21 MB wasm runtime with a 403, so before loading we probe whether this host
+// actually serves it and fall back to the jsdelivr CDN copy when it doesn't —
+// otherwise onnxruntime aborts with a bare error code on every backend.
 
 import {
   pipeline,
@@ -15,8 +16,7 @@ import {
 } from "./vendor/transformers.min.js";
 
 const VENDOR_URL = new URL("./vendor/", self.location.href).href;
-const CDN_DIST = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/";
-env.backends.onnx.wasm.wasmPaths = VENDOR_URL;
+let CDN_DIST = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/dist/";
 
 let generator = null;
 let loadedModelId = null;
@@ -123,6 +123,23 @@ async function probeUrl(url) {
   }
 }
 
+// Some static hosts (e.g. raw.githack) refuse to serve the large (21 MB) wasm
+// runtime with a 403, which makes onnxruntime abort on load. A HEAD can be
+// forbidden while a GET works, so probe with a 1-byte ranged GET.
+async function hostServesVendorWasm(opts) {
+  if (opts.vendorBlocked) return false; // test hook
+  try {
+    const r = await fetch(VENDOR_URL + "ort-wasm-simd-threaded.jsep.wasm", {
+      headers: { Range: "bytes=0-0" },
+      cache: "no-store",
+    });
+    if (r.body) { try { await r.body.cancel(); } catch {} }
+    return r.ok || r.status === 206;
+  } catch {
+    return false;
+  }
+}
+
 // GET + parse: a filtering proxy can answer 200 with an HTML block page, so a
 // status check alone would lie — verify the body is the JSON it claims to be.
 async function probeJson(url) {
@@ -172,11 +189,11 @@ async function runDiagnostics(modelId) {
 
 async function load(modelId, opts = {}) {
   if (opts.remoteHost) env.remoteHost = opts.remoteHost; // test hook
+  if (opts.wasmCdn) CDN_DIST = opts.wasmCdn; // test hook
   // Page-controlled recovery options. These must be applied in a FRESH worker:
   // onnxruntime latches a failed wasm init, so the page respawns this worker
   // and passes the adjusted configuration instead of retrying in place.
   if (opts.numThreads) env.backends.onnx.wasm.numThreads = opts.numThreads;
-  if (opts.wasmSource === "cdn") env.backends.onnx.wasm.wasmPaths = CDN_DIST;
   if (opts.testCrashGenerate) crashGenOnce = true; // test hook
 
   if (generator && loadedModelId === modelId) {
@@ -190,6 +207,16 @@ async function load(modelId, opts = {}) {
     generator = null;
     loadedModelId = null;
   }
+
+  // Decide where the wasm runtime comes from BEFORE the first load attempt: a
+  // failed wasm init is latched for the worker's lifetime, so a same-origin
+  // 403 (host won't serve the big file) must never be attempted. Prefer the
+  // vendored same-origin copy; fall back to the CDN the moment it's not served.
+  let wasmSource;
+  if (opts.wasmSource === "cdn") wasmSource = "cdn";
+  else wasmSource = (await hostServesVendorWasm(opts)) ? "vendor" : "cdn";
+  env.backends.onnx.wasm.wasmPaths = wasmSource === "cdn" ? CDN_DIST : VENDOR_URL;
+  self.postMessage({ type: "wasm-source", source: wasmSource });
 
   const attempts = await buildAttempts(opts);
   const failures = [];

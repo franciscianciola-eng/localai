@@ -31,6 +31,19 @@ const server = http.createServer(async (req, res) => {
   }
   // Fake hub serves the tiny fixture for ANY requested model id, so tests can
   // exercise the app's real model registry (step-down, defaults) offline.
+  // A stand-in CDN mirror serving the vendored runtime files (used to test the
+  // fallback when the host itself refuses to serve the big wasm).
+  if (p.startsWith("/cdnmirror/")) {
+    const f = path.join(root, "vendor", p.slice("/cdnmirror/".length));
+    try {
+      const data = await readFile(f);
+      res.writeHead(200, {
+        "content-type": types[path.extname(f)] || "application/octet-stream",
+        "access-control-allow-origin": "*",
+      });
+      return res.end(data);
+    } catch { res.writeHead(404); return res.end("nf"); }
+  }
   const hub = p.match(/^\/hub\/(.+?)\/resolve\/[^/]+\/(.+)$/);
   const file = hub
     ? path.join(root, "test", "fixtures", "tiny-llm", hub[2])
@@ -155,7 +168,33 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
-// ---------- Test 4: heavy model crashes at load -> auto step-down to smaller ----------
+// ---------- Test 4: host blocks the vendored wasm -> load from the CDN ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const logs = [];
+  page.on("console", (m) => logs.push(`[${m.type()}] ${m.text()}`));
+  // vendorblocked=1 simulates the host's 403 on the big wasm; wasmcdn points the
+  // CDN fallback at a local mirror so the whole thing runs offline.
+  await page.goto(
+    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/` +
+    `&vendorblocked=1&wasmcdn=http://localhost:${PORT}/cdnmirror/`,
+    { waitUntil: "load" }
+  );
+  await page.fill("#input", "Load from the CDN please");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 90000 })
+    .then(() => true)
+    .catch(() => false);
+  check("model loads via CDN when host blocks the vendored wasm", replied, logs.slice(-6).join(" | "));
+  if (replied) {
+    const src = await page.evaluate(() => window.__lastWasmSource);
+    check("runtime source reported as CDN", src === "cdn", String(src));
+  }
+  await page.close();
+}
+
+// ---------- Test 5: heavy model crashes at load -> auto step-down to smaller ----------
 {
   const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await context.addInitScript(() => {

@@ -79,9 +79,12 @@ download.
   multiple cores. A tiny service worker (`coi-serviceworker.js`) adds the
   COOP/COEP headers GitHub Pages can't set, which unlocks
   `SharedArrayBuffer` and multithreading (one automatic reload on first visit).
-- **Self-hosted runtime** — the inference engine (`vendor/`) ships with the
-  app, so no CDN needs to be reachable; only the weights come from
-  Hugging Face, once.
+- **Self-hosted runtime with CDN fallback** — the inference engine (`vendor/`)
+  ships with the app. Some static hosts refuse to serve its 21 MB WebAssembly
+  file, so the app probes for that up front and transparently loads the runtime
+  from the jsdelivr CDN when the host won't; only the model weights come from
+  Hugging Face, once. (GitHub Pages serves the vendored copy fine — it's the
+  most reliable place to host this app.)
 - **One-time download, permanent cache** — weights are stored in the browser's
   Cache Storage, so reopening the page does no re-downloading.
 - **Short prompt window** — the chat keeps a trimmed rolling history so

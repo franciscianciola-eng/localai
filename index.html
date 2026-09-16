@@ -253,7 +253,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v6"; // bump on every push — shown in the footer
+const APP_VERSION = "v7"; // bump on every push — shown in the footer
 const MODELS = {
   "smollm2-135m": {
     id: "onnx-community/SmolLM2-135M-Instruct-ONNX",
@@ -301,6 +301,7 @@ let currentBubble = null;
 let currentText = "";
 let errorCard = null;
 let engineDead = false;
+let lastWasmSource = null; // "vendor" | "cdn", reported by the worker
 
 // The conversation survives app-initiated reloads (the first-visit isolation
 // reload and compatibility-mode recovery) via per-tab sessionStorage.
@@ -337,6 +338,8 @@ try {
 } catch {}
 if (params.get("crashgen")) workerOpts.testCrashGenerate = true; // test hook
 if (params.get("crashload")) workerOpts.testCrashLoad = true;    // test hook
+if (params.get("vendorblocked")) workerOpts.vendorBlocked = true; // test hook
+if (params.get("wasmcdn")) workerOpts.wasmCdn = params.get("wasmcdn"); // test hook
 
 function spawnWorker() {
   if (worker) worker.terminate();
@@ -614,10 +617,15 @@ async function attemptRecovery(failures, diag) {
     workerOpts.numThreads = 1;
     return retry("Retrying single-threaded…");
   }
-  if (kinds.has("backend") && diag.vendorWasm && !diag.vendorWasm.ok && !recovery.cdnWasm) {
+  // The host wouldn't serve the wasm runtime (a 403 on the big file makes
+  // every backend abort). Force the CDN copy — but only if we weren't already
+  // using it, so a genuine crash on the CDN runtime falls through to step-down.
+  if ((kinds.has("backend") || kinds.has("engine-crash")) &&
+      (!diag.vendorWasm || !diag.vendorWasm.ok) &&
+      lastWasmSource !== "cdn" && workerOpts.wasmSource !== "cdn" && !recovery.cdnWasm) {
     recovery.cdnWasm = true;
     workerOpts.wasmSource = "cdn";
-    return retry("Retrying with the CDN runtime…");
+    return retry("Loading the AI runtime from the CDN…");
   }
   // Too heavy for this device (out of memory, or the engine crashed on it):
   // automatically step down to the next smaller model until one runs.
@@ -651,6 +659,13 @@ function handleWorkerMessage(e) {
       deviceChip.textContent = label;
       deviceChip.className = "chip" + (msg.device === "webgpu" ? " ok" : "");
       $("loadDetail").textContent = "Trying " + msg.attempt + "…";
+      break;
+    }
+    case "wasm-source": {
+      lastWasmSource = msg.source;
+      window.__lastWasmSource = msg.source; // test hook
+      deviceChip.title = "AI runtime loaded from " +
+        (msg.source === "cdn" ? "the CDN" : "this site");
       break;
     }
     case "progress": {
