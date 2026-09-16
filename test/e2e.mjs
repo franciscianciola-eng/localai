@@ -31,6 +31,13 @@ const server = http.createServer(async (req, res) => {
   }
   // Fake hub serves the tiny fixture for ANY requested model id, so tests can
   // exercise the app's real model registry (step-down, defaults) offline.
+  // A stand-in Wikipedia MediaWiki API for the web-search test.
+  if (p === "/wikiapi") {
+    res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });
+    return res.end(JSON.stringify({
+      query: { pages: { "1": { index: 1, title: "Photosynthesis", extract: "CANARYTOKEN123 Plants make food from light." } } },
+    }));
+  }
   // A stand-in CDN mirror serving the vendored runtime files (used to test the
   // fallback when the host itself refuses to serve the big wasm).
   if (p.startsWith("/cdnmirror/")) {
@@ -314,7 +321,51 @@ const check = (name, cond, extra = "") => {
   await ctx.close();
 }
 
-// ---------- Test 10: heavy model crashes at load -> auto step-down to smaller ----------
+// ---------- Test 10: settings panel opens, toggles persist, theme applies ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await page.goto(`http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`, { waitUntil: "load" });
+  await page.click("#settingsBtn");
+  check("settings modal opens", await page.isVisible(".modal"));
+  // Toggle web search on (click the visible slider) and confirm it persists.
+  await page.click("#setWebSearch + .slider");
+  const persisted = await page.evaluate(() => JSON.parse(localStorage.getItem("localai-settings") || "{}").webSearch);
+  check("web search toggle persists", persisted === true);
+  check("header shows the web-search indicator", await page.isVisible("#searchNote"));
+  // Dark theme applies immediately.
+  await page.click('#setTheme button[data-v="dark"]');
+  const theme = await page.getAttribute("html", "data-theme");
+  check("dark theme applied", theme === "dark", String(theme));
+  await page.click("#settingsClose");
+  check("settings modal closes", !(await page.isVisible(".modal")));
+  await page.close();
+}
+
+// ---------- Test 11: web search injects Wikipedia context into the prompt ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem("localai-settings", JSON.stringify({ webSearch: true })); } catch {}
+  });
+  const page = await ctx.newPage();
+  await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1&searchapi=http://localhost:${PORT}/wikiapi`, { waitUntil: "load" });
+  await page.fill("#input", "how do plants eat");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 30000 })
+    .then(() => true)
+    .catch(() => false);
+  check("reply completes with web search on", replied);
+  if (replied) {
+    const msgs = await page.evaluate(() => JSON.stringify(window.__mockLastMessages || []));
+    check("Wikipedia context was injected into the prompt", msgs.includes("CANARYTOKEN123"), msgs.slice(0, 120));
+    const src = await page.textContent("#messages");
+    check("search sources shown in the chat", /Web search.*Photosynthesis/s.test(src));
+  }
+  await ctx.close();
+}
+
+// ---------- Test 12: heavy model crashes at load -> auto step-down to smaller ----------
 {
   const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await context.addInitScript(() => {

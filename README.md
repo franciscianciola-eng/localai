@@ -153,6 +153,28 @@ integrated-only machines.
 Status chips in the header show which backend you got (WebGPU vs CPU threads)
 and live tokens/second while the model is talking.
 
+## Settings
+
+Open the **⚙️ gear** in the header:
+
+- **Web search** *(off by default)* — an optional "internet sandbox". When on,
+  your message is sent to **Wikipedia's public API** (CORS-enabled, no key,
+  read-only) to fetch relevant facts, which are handed to the local model as
+  grounding, with the sources shown in the chat. This is the **only** feature
+  that sends anything off your device, which is why it's off unless you opt in.
+  (A keyless, backend-less page can only reach APIs that allow cross-origin
+  requests, so Wikipedia is the safe, reliable source here.)
+- **Reply length** — Short / Medium / Long output cap.
+- **Creativity** — temperature, from Precise to Wild.
+- **Performance mode** — Auto (tunes for integrated graphics and backs off on
+  crashes), Full, Eco, or Low-power for the WebGPU models.
+- **Theme** — System / Light / Dark.
+- **Send with Enter** — Enter sends vs. Enter makes a newline.
+- **Custom instructions** — a persona/system-prompt addition.
+- **Storage** — see cache usage and clear cached models to free space.
+
+All settings are saved in the browser.
+
 ## How it works
 
 No build step:

@@ -51,8 +51,10 @@
     --warn: #b45309;
     color-scheme: light dark;
   }
+  /* Dark palette: applied when the system is dark (unless the user forced
+     light), and always when the user forced dark. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0e1116;
       --panel: #161b22;
       --panel-2: #1f2630;
@@ -67,6 +69,21 @@
       --code-bg: #10141a;
       --warn: #fbbf24;
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1f2630;
+    --text: #e6e8eb;
+    --muted: #8b939e;
+    --accent: #6c8cff;
+    --accent-text: #0e1116;
+    --user-bubble: #33415e;
+    --user-text: #e6e8eb;
+    --bot-bubble: #161b22;
+    --border: #2a323d;
+    --code-bg: #10141a;
+    --warn: #fbbf24;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -209,6 +226,46 @@
   textarea:focus { border-color: var(--accent); }
   .foot-note { max-width: 760px; margin: 6px auto 0; font-size: 11px; color: var(--muted); text-align: center; }
   .foot-note.warn { color: var(--warn); }
+  .iconbtn { padding: 6px 10px; font-size: 16px; line-height: 1; }
+  .search-note { font-size: 11px; color: var(--accent); }
+
+  /* Settings modal */
+  .overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,.45);
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 24px 16px; overflow-y: auto;
+  }
+  .modal {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 14px;
+    width: min(560px, 100%); margin: auto;
+    box-shadow: 0 12px 40px rgba(0,0,0,.35);
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .modal-head h2 { margin: 0; font-size: 16px; }
+  .modal-body { padding: 6px 18px 12px; }
+  .setting { padding: 12px 0; border-bottom: 1px solid var(--border); }
+  .setting:last-child { border-bottom: none; }
+  .setting .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .setting .name { font-weight: 600; font-size: 14px; }
+  .setting .desc { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .setting .desc.warn { color: var(--warn); }
+  .setting input[type=range] { width: 100%; margin-top: 10px; accent-color: var(--accent); }
+  .setting textarea { width: 100%; margin-top: 8px; min-height: 60px; }
+  .setting select { max-width: none; }
+  .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; flex-shrink: 0; }
+  .segmented button { border: none; border-radius: 0; background: var(--panel-2); padding: 6px 10px; font-size: 13px; }
+  .segmented button.on { background: var(--accent); color: var(--accent-text); font-weight: 600; }
+  /* Toggle switch */
+  .switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider { position: absolute; inset: 0; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; transition: .15s; cursor: pointer; }
+  .switch .slider::before { content: ""; position: absolute; width: 18px; height: 18px; left: 2px; top: 2px; background: var(--muted); border-radius: 50%; transition: .15s; }
+  .switch input:checked + .slider { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: var(--accent-text); }
+  .rangeval { font-size: 12px; color: var(--muted); min-width: 74px; text-align: right; }
+  .modal .storage { font-size: 12px; color: var(--muted); margin-top: 6px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -219,9 +276,100 @@
   <select id="modelSelect" title="Model"></select>
   <span class="chip" id="deviceChip">starting…</span>
   <span class="chip" id="speedChip" hidden></span>
+  <span class="chip search-note" id="searchNote" hidden>🔎 web search on</span>
   <div class="spacer"></div>
+  <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙️</button>
   <button id="clearBtn" title="Clear the conversation">Clear</button>
 </header>
+
+<div class="overlay" id="settingsOverlay" hidden>
+  <div class="modal" role="dialog" aria-label="Settings">
+    <div class="modal-head">
+      <h2>Settings</h2>
+      <button id="settingsClose" class="iconbtn" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="setting">
+        <div class="top">
+          <div>
+            <div class="name">Web search</div>
+            <div class="desc warn">Off by default. When on, your message is sent to Wikipedia's public API
+              to fetch relevant facts the model can use. This is the only time anything leaves your device.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="setWebSearch"><span class="slider"></span></label>
+        </div>
+      </div>
+
+      <div class="setting">
+        <div class="top">
+          <div class="name">Reply length</div>
+          <div class="segmented" id="setMaxTokens">
+            <button data-v="256">Short</button>
+            <button data-v="512">Medium</button>
+            <button data-v="1024">Long</button>
+          </div>
+        </div>
+        <div class="desc">How many tokens the model may generate per reply. Shorter is faster and lighter on the GPU.</div>
+      </div>
+
+      <div class="setting">
+        <div class="top">
+          <div class="name">Creativity</div>
+          <div class="rangeval" id="setTempVal">Balanced</div>
+        </div>
+        <input type="range" id="setTemp" min="0" max="1.2" step="0.1" value="0.6">
+        <div class="desc">Lower = precise and repetitive; higher = varied and creative.</div>
+      </div>
+
+      <div class="setting">
+        <div class="top">
+          <div class="name">Performance mode</div>
+          <div class="segmented" id="setPerf">
+            <button data-v="auto">Auto</button>
+            <button data-v="full">Full</button>
+            <button data-v="eco">Eco</button>
+            <button data-v="lowpower">Low-power</button>
+          </div>
+        </div>
+        <div class="desc">For the WebGPU (large) models. Auto tunes for integrated graphics and backs off if it crashes;
+          Full uses more GPU; Eco / Low-power reduce load to stay stable on weak GPUs.</div>
+      </div>
+
+      <div class="setting">
+        <div class="top">
+          <div class="name">Theme</div>
+          <div class="segmented" id="setTheme">
+            <button data-v="system">System</button>
+            <button data-v="light">Light</button>
+            <button data-v="dark">Dark</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="setting">
+        <div class="top"><div class="name">Send with Enter</div>
+          <label class="switch"><input type="checkbox" id="setEnter"><span class="slider"></span></label>
+        </div>
+        <div class="desc">On: Enter sends, Shift+Enter makes a new line. Off: Enter makes a new line.</div>
+      </div>
+
+      <div class="setting">
+        <div class="name">Custom instructions</div>
+        <textarea id="setPersona" placeholder="e.g. Answer like a pirate. Keep replies under 3 sentences."></textarea>
+        <div class="desc">Added to the assistant's system prompt. Leave blank for the default helpful assistant.</div>
+      </div>
+
+      <div class="setting">
+        <div class="top"><div class="name">Storage</div>
+          <button id="clearCacheBtn" class="danger">Clear cached models</button>
+        </div>
+        <div class="storage" id="storageInfo">Checking storage…</div>
+      </div>
+
+    </div>
+  </div>
+</div>
 
 <div id="chat">
   <div class="inner" id="messages">
@@ -253,7 +401,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v10"; // bump on every push — shown in the footer
+const APP_VERSION = "v11"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
@@ -320,13 +468,43 @@ const THROTTLE = [
   { maxTokens: 200, paceMs: 28, historyTurns: 4,  lowmem: true,  label: "low-power mode" },
 ];
 const WATCHDOG_MS = 25000; // no token for this long ⇒ the GPU context is wedged
-const SYSTEM_PROMPT =
+const BASE_SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
+function systemPrompt() {
+  const persona = (settings.persona || "").trim();
+  return persona ? BASE_SYSTEM_PROMPT + "\n\n" + persona : BASE_SYSTEM_PROMPT;
+}
 
 const params = new URLSearchParams(location.search);
 const customModelId = params.get("modelId"); // test/advanced hook
 const hubOverride = params.get("hub");       // test hook: alternate weights host
+// Test hook: point web search at a local endpoint instead of Wikipedia.
+const SEARCH_ENDPOINT = params.get("searchapi") || "https://en.wikipedia.org/w/api.php";
+
+const SETTINGS_DEFAULTS = {
+  webSearch: false,   // OFF by default — the only feature that sends data out
+  maxTokens: 512,
+  temperature: 0.6,
+  perfMode: "auto",   // auto | full | eco | lowpower
+  theme: "system",    // system | light | dark
+  enterToSend: true,
+  persona: "",
+};
+let settings = { ...SETTINGS_DEFAULTS };
+try {
+  const saved = JSON.parse(localStorage.getItem("localai-settings") || "{}");
+  settings = { ...SETTINGS_DEFAULTS, ...(saved && typeof saved === "object" ? saved : {}) };
+} catch {}
+function saveSettings() {
+  try { localStorage.setItem("localai-settings", JSON.stringify(settings)); } catch {}
+}
+function applyTheme() {
+  const t = settings.theme;
+  if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  else document.documentElement.removeAttribute("data-theme");
+}
+applyTheme();
 
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat");
@@ -392,8 +570,11 @@ async function hasWebGPU() {
 // Big (GPU) models start throttled because the target device is integrated
 // graphics; small models start at whatever floor this device has learned.
 function effectiveThrottle() {
-  const sel = MODELS[modelSelect.value];
-  const floor = sel && sel.gpu ? 1 : 0;
+  let floor;
+  if (settings.perfMode === "full") floor = 0;
+  else if (settings.perfMode === "eco") floor = 1;
+  else if (settings.perfMode === "lowpower") floor = 2;
+  else { const sel = MODELS[modelSelect.value]; floor = sel && sel.gpu ? 1 : 0; }
   return Math.min(THROTTLE.length - 1, Math.max(throttleLevel, floor));
 }
 function throttleName(level) {
@@ -605,20 +786,42 @@ async function loadModel() {
   updateUiState();
 }
 
-function startGeneration() {
-  const recent = history.slice(-12);
-  const messages = [{ role: "system", content: SYSTEM_PROMPT }, ...recent];
+async function startGeneration() {
   generating = true;
   awaitingModel = false;
   setNote(null);
   currentText = "";
+  speedChip.hidden = false;
+  speedChip.textContent = settings.webSearch ? "searching…" : "thinking…";
+  updateUiState();
+
+  const recent = history.slice(-12);
+  const msgs = [{ role: "system", content: systemPrompt() }];
+
+  // Optional web-search grounding: fetch relevant facts and give them to the
+  // model as an extra system message before it answers.
+  if (settings.webSearch) {
+    const lastUser = [...history].reverse().find((m) => m.role === "user");
+    if (lastUser) {
+      const found = await webSearch(lastUser.content).catch(() => null);
+      if (found && found.context) {
+        msgs.push({
+          role: "system",
+          content: "Relevant information from a web search (Wikipedia). Use it if helpful:\n\n" + found.context,
+        });
+        showSearchSources(found.sources);
+      }
+    }
+  }
+  msgs.push(...recent);
+
+  // Create the reply bubble now (below the optional search-sources line).
   currentBubble = addBubble("bot", "");
   currentBubble.innerHTML = '<span class="cursor"></span>';
-  speedChip.hidden = false;
   speedChip.textContent = "thinking…";
-  updateUiState();
-  if (engineMode === "webllm") generateWebLLM(messages);
-  else worker.postMessage({ type: "generate", messages, params: {} });
+  const genParams = { temperature: settings.temperature, max_new_tokens: settings.maxTokens };
+  if (engineMode === "webllm") generateWebLLM(msgs);
+  else worker.postMessage({ type: "generate", messages: msgs, params: genParams });
 }
 
 function send(text) {
@@ -848,6 +1051,48 @@ async function attemptRecovery(failures, diag) {
   showLoadError(failures, diag);
 }
 
+// ---- Optional web search (Wikipedia, CORS-enabled, no API key) ----
+// The "internet sandbox": read-only public Wikipedia content, fetched with a
+// single CORS request. Off by default; only runs when the setting is on.
+async function webSearch(query) {
+  const q = (query || "").slice(0, 300);
+  if (!q) return null;
+  const low = effectiveThrottle() >= 2; // keep the prompt tiny in low-power mode
+  const url = SEARCH_ENDPOINT +
+    "?action=query&generator=search&gsrsearch=" + encodeURIComponent(q) +
+    "&gsrlimit=2&prop=extracts&exintro=1&explaintext=1&exsectionformat=plain" +
+    "&exchars=" + (low ? 350 : 700) + "&format=json&origin=*";
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) return null;
+  const data = await res.json();
+  const pages = data?.query?.pages ? Object.values(data.query.pages) : [];
+  pages.sort((a, b) => (a.index || 0) - (b.index || 0));
+  const cap = low ? 700 : 1500;
+  const sources = [];
+  let context = "";
+  for (const p of pages) {
+    if (!p.extract) continue;
+    sources.push(p.title);
+    context += p.title + ": " + p.extract.trim() + "\n\n";
+    if (context.length > cap) break;
+  }
+  context = context.slice(0, cap).trim();
+  return context ? { context, sources } : null;
+}
+
+function showSearchSources(sources) {
+  if (!sources || !sources.length) return;
+  heroEl.hidden = true;
+  const wrap = document.createElement("div");
+  wrap.className = "msg bot";
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.innerHTML = '<div class="meta">🔎 Web search · ' + sources.map(escapeHtml).join(" · ") + "</div>";
+  wrap.appendChild(b);
+  messagesEl.appendChild(wrap);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 // ---- WebLLM engine (WebGPU, on this thread) ----
 // Test-only stand-in for the WebLLM module so the integration (load → stream →
 // done → stop) can be exercised without WebGPU or the real CDN.
@@ -861,7 +1106,8 @@ function makeMockWebLLM() {
       }
       window.__mockModelId = modelId;
       return {
-        chat: { completions: { async create() {
+        chat: { completions: { async create(req) {
+          window.__mockLastMessages = req?.messages;
           if ((window.__mockGenCrashes | 0) > 0) { window.__mockGenCrashes--; throw new Error("mock gen crash: device lost"); }
           const words = ["Hello", " from", " the", " WebGPU", " engine", "."];
           return (async function* () { for (const w of words) { await new Promise((r) => setTimeout(r, 5)); yield { choices: [{ delta: { content: w } }] }; } })();
@@ -936,9 +1182,9 @@ async function generateWebLLM(messages) {
     const stream = await webllmEngine.chat.completions.create({
       messages: trimmed,
       stream: true,
-      temperature: 0.6,
+      temperature: settings.temperature,
       top_p: 0.9,
-      max_tokens: t.maxTokens,
+      max_tokens: Math.min(t.maxTokens, settings.maxTokens || t.maxTokens),
     });
     // Watchdog: if the GPU wedges, no token arrives — treat a long silence as a
     // crash so recovery can back off, rather than hanging forever.
@@ -1217,7 +1463,7 @@ try {
   }
 } catch {}
 inputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  if (e.key === "Enter" && !e.shiftKey && settings.enterToSend) {
     e.preventDefault();
     send();
   }
@@ -1226,6 +1472,70 @@ heroEl.addEventListener("click", (e) => {
   const q = e.target?.dataset?.q;
   if (q) send(q);
 });
+
+// ---- Settings panel ----
+function tempLabel(v) {
+  v = +v;
+  if (v <= 0.3) return "Precise";
+  if (v <= 0.7) return "Balanced";
+  if (v <= 1.0) return "Creative";
+  return "Wild";
+}
+function markSegmented(container, value) {
+  container.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === String(value)));
+}
+function refreshSearchNote() {
+  $("searchNote").hidden = !settings.webSearch;
+}
+async function refreshStorageInfo() {
+  const el = $("storageInfo");
+  try {
+    if (navigator.storage?.estimate) {
+      const est = await navigator.storage.estimate();
+      const used = (est.usage || 0) / 1073741824, quota = (est.quota || 0) / 1073741824;
+      el.textContent = "Cached data: " + used.toFixed(2) + " GB used of ~" + quota.toFixed(1) + " GB available.";
+    } else { el.textContent = "Storage usage isn't reported by this browser."; }
+  } catch { el.textContent = ""; }
+}
+function syncSettingsUI() {
+  $("setWebSearch").checked = settings.webSearch;
+  $("setEnter").checked = settings.enterToSend;
+  markSegmented($("setMaxTokens"), settings.maxTokens);
+  markSegmented($("setPerf"), settings.perfMode);
+  markSegmented($("setTheme"), settings.theme);
+  $("setTemp").value = settings.temperature;
+  $("setTempVal").textContent = tempLabel(settings.temperature);
+  $("setPersona").value = settings.persona || "";
+  refreshSearchNote();
+}
+function openSettings() { syncSettingsUI(); refreshStorageInfo(); $("settingsOverlay").hidden = false; }
+function closeSettings() { $("settingsOverlay").hidden = true; }
+
+$("settingsBtn").addEventListener("click", openSettings);
+$("settingsClose").addEventListener("click", closeSettings);
+$("settingsOverlay").addEventListener("click", (e) => { if (e.target === $("settingsOverlay")) closeSettings(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("settingsOverlay").hidden) closeSettings(); });
+
+$("setWebSearch").addEventListener("change", (e) => { settings.webSearch = e.target.checked; saveSettings(); refreshSearchNote(); });
+$("setEnter").addEventListener("change", (e) => { settings.enterToSend = e.target.checked; saveSettings(); });
+$("setTemp").addEventListener("input", (e) => { settings.temperature = +e.target.value; $("setTempVal").textContent = tempLabel(e.target.value); saveSettings(); });
+$("setPersona").addEventListener("input", (e) => { settings.persona = e.target.value; saveSettings(); });
+$("setMaxTokens").addEventListener("click", (e) => { const v = e.target?.dataset?.v; if (v) { settings.maxTokens = +v; saveSettings(); markSegmented($("setMaxTokens"), settings.maxTokens); } });
+$("setPerf").addEventListener("click", (e) => { const v = e.target?.dataset?.v; if (v) { settings.perfMode = v; saveSettings(); markSegmented($("setPerf"), v); } });
+$("setTheme").addEventListener("click", (e) => { const v = e.target?.dataset?.v; if (v) { settings.theme = v; saveSettings(); applyTheme(); markSegmented($("setTheme"), v); } });
+$("clearCacheBtn").addEventListener("click", async (e) => {
+  e.target.textContent = "Clearing…";
+  try { await caches.delete("transformers-cache"); } catch {}
+  try {
+    if (window.indexedDB?.databases) {
+      const dbs = await indexedDB.databases();
+      await Promise.all((dbs || []).map((d) => d.name && new Promise((res) => { const r = indexedDB.deleteDatabase(d.name); r.onsuccess = r.onerror = r.onblocked = () => res(); })));
+    }
+  } catch {}
+  e.target.textContent = "Cleared — reload to re-download";
+  refreshStorageInfo();
+});
+refreshSearchNote();
 
 console.log("LocalAI " + APP_VERSION);
 setNote(null);
