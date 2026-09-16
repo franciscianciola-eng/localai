@@ -253,7 +253,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v9"; // bump on every push — shown in the footer
+const APP_VERSION = "v10"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
@@ -301,6 +301,25 @@ const WEBLLM_MODELS = {
   "gemma2-2b": "gemma-2-2b-it-q4f16_1-MLC",
   "phi35-mini": "Phi-3.5-mini-instruct-q4f16_1-MLC",
 };
+// Low-memory (1k context) WebLLM builds — a much smaller KV cache, which is the
+// main thing that pushes a big model past an integrated GPU's memory and
+// crashes it. Used at higher throttle levels; models without a -1k build keep
+// their normal id.
+const WEBLLM_MODELS_LOWMEM = {
+  "gemma2-2b": "gemma-2-2b-it-q4f16_1-MLC-1k",
+  "phi35-mini": "Phi-3.5-mini-instruct-q4f16_1-MLC-1k",
+};
+// Escalating throttle levels: each does progressively less GPU work so the app
+// can back off to a load the device can actually sustain. A browser can't read
+// GPU temperature/power or change clock speeds — reducing the workload (context
+// size, output length, and sustained utilisation via per-token pacing) is the
+// only real lever, so that's what these do.
+const THROTTLE = [
+  { maxTokens: 512, paceMs: 0,  historyTurns: 12, lowmem: false, label: "" },
+  { maxTokens: 256, paceMs: 12, historyTurns: 6,  lowmem: false, label: "eco mode" },
+  { maxTokens: 200, paceMs: 28, historyTurns: 4,  lowmem: true,  label: "low-power mode" },
+];
+const WATCHDOG_MS = 25000; // no token for this long ⇒ the GPU context is wedged
 const SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
@@ -341,13 +360,97 @@ if (params.get("forcewebllm")) engineMode = "webllm"; // test hook
 let webllmEngine = null;
 let webllmStop = false;
 let webgpuOk = null; // cached WebGPU availability probe
+let webgpuInfo = null; // cached adapter info (vendor/limits/fallback)
+// Throttle floor learned for this device (persisted). Big models also get a
+// built-in floor since the target is integrated graphics.
+let throttleLevel = 0;
+try { throttleLevel = Math.min(THROTTLE.length - 1, Math.max(0, parseInt(localStorage.getItem("localai-throttle") || "0", 10) || 0)); } catch {}
+let webllmCrashCount = 0; // per-message escalation guard
+window.__throttle = throttleLevel;
 
 async function hasWebGPU() {
   if (params.get("webllmmock")) return true; // test hook
   if (webgpuOk !== null) return webgpuOk;
-  try { webgpuOk = !!(navigator.gpu && (await navigator.gpu.requestAdapter())); }
-  catch { webgpuOk = false; }
+  try {
+    // No powerPreference: the browser picks the best adapter, preferring a
+    // discrete/external GPU when present and falling back to integrated — so
+    // an eGPU is used automatically, but the workload is tuned for integrated.
+    const adapter = navigator.gpu && (await navigator.gpu.requestAdapter());
+    webgpuOk = !!adapter;
+    if (adapter) {
+      const L = adapter.limits || {};
+      webgpuInfo = {
+        isFallbackAdapter: !!adapter.isFallbackAdapter,
+        maxBufferSize: L.maxBufferSize,
+        maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
+      };
+    }
+  } catch { webgpuOk = false; }
   return webgpuOk;
+}
+
+// Big (GPU) models start throttled because the target device is integrated
+// graphics; small models start at whatever floor this device has learned.
+function effectiveThrottle() {
+  const sel = MODELS[modelSelect.value];
+  const floor = sel && sel.gpu ? 1 : 0;
+  return Math.min(THROTTLE.length - 1, Math.max(throttleLevel, floor));
+}
+function throttleName(level) {
+  return THROTTLE[level].label || (level > 0 ? "reduced load" : "full speed");
+}
+function webllmModelId(key, level) {
+  if (THROTTLE[level].lowmem && WEBLLM_MODELS_LOWMEM[key]) return WEBLLM_MODELS_LOWMEM[key];
+  return WEBLLM_MODELS[key] || WEBLLM_MODELS[DEFAULT_MODEL];
+}
+// Back off one notch: raise the throttle floor, or (at the ceiling) step down
+// to the next smaller model at a reduced-but-not-max level. Returns the action
+// taken, or false when nothing is left to try.
+function escalateOrStepDown() {
+  if (webllmCrashCount++ > 12) return false;
+  const eff = effectiveThrottle();
+  if (eff < THROTTLE.length - 1) {
+    throttleLevel = eff + 1;
+    try { localStorage.setItem("localai-throttle", String(throttleLevel)); } catch {}
+    window.__throttle = throttleLevel;
+    return "throttle";
+  }
+  const idx = MODEL_ORDER.indexOf(modelSelect.value);
+  const smaller = idx >= 0 ? MODEL_ORDER[idx + 1] : null;
+  if (smaller) {
+    modelSelect.value = smaller;
+    try { localStorage.setItem("localai-model", smaller); } catch {}
+    throttleLevel = 1;
+    try { localStorage.setItem("localai-throttle", "1"); } catch {}
+    window.__throttle = throttleLevel;
+    return "stepdown";
+  }
+  return false;
+}
+// Shared crash handler for the WebGPU engine (load or generation failure):
+// back off and retry, re-answering the pending message when it crashed mid-reply.
+async function onWebLLMCrash(err, duringGeneration) {
+  generating = false;
+  speedChip.hidden = true;
+  if (currentBubble) { currentBubble.parentElement?.remove(); currentBubble = null; }
+  try { webllmEngine?.interruptGenerate?.(); } catch {}
+  try { await webllmEngine?.unload?.(); } catch {}
+  webllmEngine = null;
+  const action = escalateOrStepDown();
+  if (action) {
+    if (duringGeneration) awaitingModel = true;
+    const name = MODELS[modelSelect.value].label.split(" · ")[0];
+    setNote(action === "stepdown"
+      ? "The GPU couldn't sustain that — switching to " + name + " at reduced load…"
+      : "The GPU nearly crashed — backing off to " + throttleName(effectiveThrottle()) + " and retrying…", true);
+    loadWebLLM();
+    return;
+  }
+  showLoadError(
+    [{ device: "webgpu", dtype: "q4f16", kind: "webllm-failed", message: String(err && err.message || err) }],
+    { engine: "webllm", webgpu: webgpuInfo, throttle: throttleLevel,
+      crossOriginIsolated: !!self.crossOriginIsolated, userAgent: navigator.userAgent }
+  );
 }
 
 // The conversation survives app-initiated reloads (the first-visit isolation
@@ -527,6 +630,7 @@ function send(text) {
   addBubble("user", content);
   history.push({ role: "user", content });
   genRetryUsed = false; // fresh crash-recovery budget for this message
+  webllmCrashCount = 0;
   if (ready) {
     startGeneration();
   } else {
@@ -570,9 +674,9 @@ function diagnose(failures, diag) {
     lines.push("The AI engine crashed inside this device's graphics or WebAssembly runtime — the app will avoid the crashing configuration from now on.");
   }
   if (kinds.has("webllm-failed")) {
-    lines.push("The WebGPU (WebLLM) engine reported: " +
+    lines.push("The WebGPU engine kept crashing even after backing off to the lowest-power settings and the smallest model. It reported: " +
       (failures.find((f) => f.kind === "webllm-failed")?.message || "unknown error") +
-      ". A large model may be too big for this device's GPU — try a smaller one; or WebGPU may be disabled (check chrome://gpu).");
+      ". This device's GPU likely can't run these models — the small CPU models (SmolLM2, Qwen2.5-0.5B) are the reliable option here. If WebGPU is disabled, check chrome://gpu.");
   }
   if (kinds.has("no-webgpu")) {
     lines.push("This model needs WebGPU, which isn't available in this browser. " +
@@ -655,6 +759,8 @@ function showLoadError(failures, diag) {
       localStorage.removeItem("localai-coi-off");
       localStorage.removeItem("localai-force-wasm");
       localStorage.removeItem("localai-model");
+      localStorage.removeItem("localai-throttle");
+      localStorage.removeItem("localai-engine");
     } catch {}
     try { sessionStorage.clear(); } catch {}
     try { await caches.delete("transformers-cache"); } catch {}
@@ -749,12 +855,19 @@ function makeMockWebLLM() {
   return {
     async CreateMLCEngine(modelId, opts) {
       for (let i = 0; i <= 100; i += 25) { opts?.initProgressCallback?.({ progress: i / 100, text: "mock " + modelId }); }
+      if ((window.__mockLoadCrashes | 0) > 0) { window.__mockLoadCrashes--; throw new Error("mock load crash: device lost"); }
+      if (window.__mockLoadCrashPattern && new RegExp(window.__mockLoadCrashPattern).test(modelId)) {
+        throw new Error("mock load crash (too big): " + modelId);
+      }
+      window.__mockModelId = modelId;
       return {
         chat: { completions: { async create() {
+          if ((window.__mockGenCrashes | 0) > 0) { window.__mockGenCrashes--; throw new Error("mock gen crash: device lost"); }
           const words = ["Hello", " from", " the", " WebGPU", " engine", "."];
           return (async function* () { for (const w of words) { await new Promise((r) => setTimeout(r, 5)); yield { choices: [{ delta: { content: w } }] }; } })();
         } } },
         interruptGenerate() {},
+        async unload() {},
       };
     },
   };
@@ -764,14 +877,22 @@ async function loadWebLLM() {
   engineMode = "webllm";
   ready = false;
   removeErrorCard();
-  const name = MODELS[modelSelect.value].label.split(" · ")[0];
-  showLoader("Loading " + name + " on the WebGPU engine…");
-  deviceChip.textContent = "WebGPU (WebLLM)";
+  const level = effectiveThrottle();
+  const key = modelSelect.value;
+  const name = MODELS[key].label.split(" · ")[0];
+  const modeText = level > 0 ? " · " + throttleName(level) : "";
+  showLoader("Loading " + name + " on the WebGPU engine" + (level > 0 ? " (" + throttleName(level) + ")" : "") + "…");
+  deviceChip.textContent = "WebGPU (WebLLM)" + modeText;
   deviceChip.className = "chip ok";
+  deviceChip.title = webgpuInfo?.isFallbackAdapter
+    ? "Software fallback GPU — large models will be slow"
+    : "Tuned for integrated graphics; an external/discrete GPU is used automatically when present";
   updateUiState();
   try {
     const webllm = params.get("webllmmock") ? makeMockWebLLM() : await import(/* @vite-ignore */ WEBLLM_CDN);
-    const modelId = WEBLLM_MODELS[modelSelect.value] || WEBLLM_MODELS[DEFAULT_MODEL];
+    const modelId = webllmModelId(key, level);
+    window.__engine = "webllm";
+    window.__throttle = throttleLevel;
     webllmEngine = await webllm.CreateMLCEngine(modelId, {
       initProgressCallback: (p) => {
         const pct = Math.round((p.progress || 0) * 100);
@@ -781,8 +902,8 @@ async function loadWebLLM() {
       },
     });
     lastWasmSource = "webllm";
-    window.__engine = "webllm";
     ready = true;
+    webllmCrashCount = 0;
     loaderEl.hidden = true;
     removeErrorCard();
     try { localStorage.setItem("localai-engine", "webllm"); } catch {}
@@ -790,56 +911,72 @@ async function loadWebLLM() {
     if (awaitingModel && history.length && history[history.length - 1].role === "user") {
       startGeneration();
     } else {
-      setNote("Running on the WebGPU engine (WebLLM).");
+      setNote(level > 0
+        ? "Running on the WebGPU engine in " + throttleName(level) + " (tuned for integrated graphics)."
+        : "Running on the WebGPU engine (WebLLM).");
       inputEl.focus();
     }
   } catch (err) {
-    webllmEngine = null;
-    // WebLLM couldn't start either — surface it with full context. Don't loop
-    // back to the onnxruntime engine (it already failed on this device).
-    showLoadError(
-      [{ device: "webgpu", dtype: "q4f16", kind: "webllm-failed", message: String(err && err.message || err) }],
-      { engine: "webllm", crossOriginIsolated: !!self.crossOriginIsolated,
-        webgpuAdapter: webgpuOk, userAgent: navigator.userAgent }
-    );
+    // A crash while loading (usually the model doesn't fit the GPU's memory):
+    // back off a notch and retry instead of dead-ending.
+    onWebLLMCrash(err, false);
   }
 }
 
 async function generateWebLLM(messages) {
   webllmStop = false;
-  let text = "";
+  const t = THROTTLE[effectiveThrottle()];
+  // Trim history to bound the prompt (fewer tokens ⇒ less memory and compute).
+  const trimmed = [messages[0], ...messages.slice(1).slice(-t.historyTurns)];
   let tokens = 0;
   let firstAt = 0;
+  let lastTokenAt = performance.now();
+  let watchdog = null;
   try {
     const stream = await webllmEngine.chat.completions.create({
-      messages,
+      messages: trimmed,
       stream: true,
       temperature: 0.6,
       top_p: 0.9,
-      max_tokens: 512,
+      max_tokens: t.maxTokens,
     });
-    for await (const chunk of stream) {
-      if (webllmStop) break;
-      const delta = chunk.choices?.[0]?.delta?.content || "";
-      if (delta) {
-        if (!firstAt) firstAt = performance.now();
-        tokens += 1;
-        const tps = firstAt ? tokens / ((performance.now() - firstAt) / 1000) : 0;
-        streamToken(delta, tps);
+    // Watchdog: if the GPU wedges, no token arrives — treat a long silence as a
+    // crash so recovery can back off, rather than hanging forever.
+    const stall = new Promise((_, reject) => {
+      watchdog = setInterval(() => {
+        if (performance.now() - lastTokenAt > WATCHDOG_MS) {
+          clearInterval(watchdog);
+          webllmStop = true;
+          try { webllmEngine?.interruptGenerate?.(); } catch {}
+          reject(new Error("GPU stalled — no output for " + (WATCHDOG_MS / 1000) + "s"));
+        }
+      }, 2000);
+    });
+    const run = (async () => {
+      for await (const chunk of stream) {
+        if (webllmStop) break;
+        const delta = chunk.choices?.[0]?.delta?.content || "";
+        if (delta) {
+          lastTokenAt = performance.now();
+          if (!firstAt) firstAt = performance.now();
+          tokens += 1;
+          streamToken(delta, firstAt ? tokens / ((performance.now() - firstAt) / 1000) : 0);
+          // Pace generation to cap sustained GPU utilisation — the closest a
+          // web page can get to "easing off the power" on a weak GPU.
+          if (t.paceMs) await new Promise((r) => setTimeout(r, t.paceMs));
+        }
       }
-    }
-    finishReply(text || currentText, {
+    })();
+    await Promise.race([run, stall]);
+    clearInterval(watchdog);
+    webllmCrashCount = 0;
+    finishReply(currentText, {
       tokens,
       tps: firstAt ? tokens / ((performance.now() - firstAt) / 1000) : 0,
     });
   } catch (err) {
-    generating = false;
-    speedChip.hidden = true;
-    if (currentBubble) { currentBubble.parentElement?.remove(); currentBubble = null; }
-    addBubble("bot", "⚠️ The WebGPU engine failed while replying: " +
-      String(err && err.message || err) + "\n\nTry a smaller model, or reload the page.");
-    setNote("Generation failed — try a smaller model.", true);
-    updateUiState();
+    clearInterval(watchdog);
+    await onWebLLMCrash(err, true);
   }
 }
 
@@ -1040,6 +1177,13 @@ clearBtn.addEventListener("click", () => {
 });
 modelSelect.addEventListener("change", () => {
   try { localStorage.setItem("localai-model", modelSelect.value); } catch {}
+  // A manual pick gets a fresh try: reset the learned throttle floor (big
+  // models still start in eco mode via effectiveThrottle) so the user isn't
+  // stuck in low-power from a previous model's crash.
+  throttleLevel = 0;
+  webllmCrashCount = 0;
+  try { localStorage.removeItem("localai-throttle"); } catch {}
+  window.__throttle = 0;
   // Respawn so an in-flight load of the previous model can't race this one
   // (two concurrent load() calls in one worker let the abandoned model win).
   // awaitingModel is kept: a queued message is answered by the new model.

@@ -105,6 +105,30 @@ automatically so that a failure in one doesn't leave you stuck:
 Both pull the same families of public open weights; WebLLM uses the
 [mlc-ai](https://huggingface.co/mlc-ai) MLC-compiled builds.
 
+### WebGPU throttling failsafe (tuned for integrated graphics)
+
+The larger models are built to run on **integrated graphics**, where the usual
+failure is the GPU running out of memory or a compute pass tripping the
+driver's watchdog and crashing. A browser can't read GPU temperature/power or
+change clock speeds, so the app instead **reduces the workload** and backs off
+automatically:
+
+- Big models **start in "eco mode"** (capped output length, trimmed chat
+  history, light per-token pacing) since integrated graphics is the target.
+- If the GPU crashes or **stalls** (a watchdog catches a wedged context), the
+  app **escalates**: eco → **low-power mode**, which also switches to the
+  **1k-context build** of the model — a much smaller KV cache, the main thing
+  that pushes a big model past an integrated GPU's memory.
+- If even the lowest setting crashes, it **steps down to the next smaller
+  model** and keeps going until one runs.
+- The working level is **remembered per device**, and the mid-reply message is
+  answered automatically after each back-off. Per-token pacing caps sustained
+  GPU utilisation — the closest a web page can get to "easing off the power."
+
+An **external/discrete GPU is used automatically** when one is present (the app
+doesn't pin the integrated adapter); the throttling just keeps things safe on
+integrated-only machines.
+
 ## Why it's fast (even on a Chromebook)
 
 - **WebGPU acceleration** — on Chromebooks/browsers with WebGPU (Chrome 113+,

@@ -260,7 +260,61 @@ const check = (name, cond, extra = "") => {
   await ctx.close();
 }
 
-// ---------- Test 8: heavy model crashes at load -> auto step-down to smaller ----------
+// ---------- Test 8: WebGPU crash mid-reply -> throttle down and recover ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem("localai-model", "phi35-mini"); } catch {}
+    window.__mockGenCrashes = 1; // first generation attempt "crashes" the GPU
+  });
+  const page = await ctx.newPage();
+  await page.goto(`http://localhost:${PORT}/?webllmmock=1`, { waitUntil: "load" });
+  await page.fill("#input", "run the big model");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 40000 })
+    .then(() => true)
+    .catch(() => false);
+  check("recovers and replies after a WebGPU crash mid-reply", replied);
+  if (replied) {
+    const thr = await page.evaluate(() => window.__throttle);
+    check("throttle level escalated after the crash", thr >= 1, "throttle=" + thr);
+    const chip = await page.textContent("#deviceChip");
+    check("device chip shows the reduced-load mode", /eco|low-power/i.test(chip), chip);
+    const model = await page.evaluate(() => window.__mockModelId);
+    check("still on the same model (throttled, not stepped down)", /Phi-3\.5/i.test(model), model);
+  }
+  await ctx.close();
+}
+
+// ---------- Test 9: big model that won't load at all -> steps down after backing off ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem("localai-model", "llama32-1b"); } catch {}
+    // The big models won't load at all; the small ones (Qwen/SmolLM2) load fine.
+    window.__mockLoadCrashPattern = "Llama-3\\.2-1B|gemma|Phi";
+  });
+  const page = await ctx.newPage();
+  await page.goto(`http://localhost:${PORT}/?webllmmock=1`, { waitUntil: "load" });
+  // It should back off through throttle levels, step down through the models,
+  // and finally land on a smaller model that loads.
+  const settled = await page
+    .waitForFunction(() =>
+      document.getElementById("loader").hidden &&
+      !document.querySelector(".card.error") &&
+      window.__mockModelId, { timeout: 60000 })
+    .then(() => true)
+    .catch(() => false);
+  check("un-loadable big model backs off and steps down to a working model", settled);
+  if (settled) {
+    const loaded = await page.evaluate(() => window.__mockModelId);
+    check("landed on a smaller model that loads", /Qwen2\.5-0\.5B|SmolLM2/i.test(loaded), loaded);
+  }
+  await ctx.close();
+}
+
+// ---------- Test 10: heavy model crashes at load -> auto step-down to smaller ----------
 {
   const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await context.addInitScript(() => {
