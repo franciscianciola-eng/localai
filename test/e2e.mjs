@@ -194,7 +194,33 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
-// ---------- Test 5: heavy model crashes at load -> auto step-down to smaller ----------
+// ---------- Test 5: WebLLM engine plumbing (mock) loads and streams ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const logs = [];
+  page.on("pageerror", (e) => logs.push("PAGEERR " + e.message));
+  // forcewebllm routes to the WebLLM engine; webllmmock swaps in a fake module.
+  await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1`, { waitUntil: "load" });
+  await page.fill("#input", "hi webgpu engine");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 30000 })
+    .then(() => true)
+    .catch(() => false);
+  check("WebLLM engine loads and completes a reply", replied, logs.join(" | "));
+  if (replied) {
+    const chip = await page.textContent("#deviceChip");
+    check("device chip shows WebLLM", /WebLLM/.test(chip), chip);
+    const text = await page.textContent(".msg.bot .bubble");
+    check("WebLLM streamed the reply text", text.includes("WebGPU engine"), text.slice(0, 80));
+    const eng = await page.evaluate(() => window.__engine);
+    check("engine reported as webllm", eng === "webllm", String(eng));
+  }
+  check("no page errors in WebLLM path", logs.length === 0, logs.join(" | "));
+  await page.close();
+}
+
+// ---------- Test 6: heavy model crashes at load -> auto step-down to smaller ----------
 {
   const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await context.addInitScript(() => {

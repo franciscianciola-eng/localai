@@ -69,6 +69,22 @@ downloaded directly from Hugging Face and quantized to 4/8-bit ONNX for speed:
 Switch models from the dropdown in the header; each is cached after its first
 download.
 
+## Two engines for maximum compatibility
+
+The app ships **two independent inference engines** and switches between them
+automatically so that a failure in one doesn't leave you stuck:
+
+1. **Transformers.js / ONNX Runtime** (default) — runs on WebGPU *or* CPU
+   (multithreaded WASM), so it works even on devices without a GPU.
+2. **WebLLM / Apache TVM** (automatic fallback) — a completely separate
+   WebGPU engine. If the ONNX Runtime engine crashes on a particular
+   browser/GPU combination (it can abort inside a native kernel on some
+   devices), and WebGPU is available, the app switches to WebLLM
+   automatically and remembers the choice for next time.
+
+Both pull the same families of public open weights; WebLLM uses the
+[mlc-ai](https://huggingface.co/mlc-ai) MLC-compiled builds.
+
 ## Why it's fast (even on a Chromebook)
 
 - **WebGPU acceleration** — on Chromebooks/browsers with WebGPU (Chrome 113+,

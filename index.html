@@ -253,7 +253,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v7"; // bump on every push — shown in the footer
+const APP_VERSION = "v8"; // bump on every push — shown in the footer
 const MODELS = {
   "smollm2-135m": {
     id: "onnx-community/SmolLM2-135M-Instruct-ONNX",
@@ -271,6 +271,17 @@ const MODELS = {
 // Heaviest → lightest, for automatic step-down when a model won't run.
 const MODEL_ORDER = ["qwen25-05b", "smollm2-360m", "smollm2-135m"];
 const DEFAULT_MODEL = "smollm2-135m";
+
+// WebLLM (MLC) is a second, independent in-browser engine built on Apache TVM
+// instead of onnxruntime. It's WebGPU-only, but it sidesteps the onnxruntime
+// runtime entirely — so it's the automatic fallback when that engine crashes
+// on a device (e.g. an onnxruntime kernel that aborts on a specific browser).
+const WEBLLM_CDN = "https://esm.run/@mlc-ai/web-llm";
+const WEBLLM_MODELS = {
+  "smollm2-135m": "SmolLM2-135M-Instruct-q0f16-MLC",
+  "smollm2-360m": "SmolLM2-360M-Instruct-q4f16_1-MLC",
+  "qwen25-05b": "Qwen2.5-0.5B-Instruct-q4f16_1-MLC",
+};
 const SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
@@ -302,6 +313,23 @@ let currentText = "";
 let errorCard = null;
 let engineDead = false;
 let lastWasmSource = null; // "vendor" | "cdn", reported by the worker
+
+// Which inference engine is active: "transformers" (onnxruntime, in the worker)
+// or "webllm" (WebGPU/TVM, on this thread). Sticky per device once WebLLM wins.
+let engineMode = "transformers";
+try { if (localStorage.getItem("localai-engine") === "webllm") engineMode = "webllm"; } catch {}
+if (params.get("forcewebllm")) engineMode = "webllm"; // test hook
+let webllmEngine = null;
+let webllmStop = false;
+let webgpuOk = null; // cached WebGPU availability probe
+
+async function hasWebGPU() {
+  if (params.get("webllmmock")) return true; // test hook
+  if (webgpuOk !== null) return webgpuOk;
+  try { webgpuOk = !!(navigator.gpu && (await navigator.gpu.requestAdapter())); }
+  catch { webgpuOk = false; }
+  return webgpuOk;
+}
 
 // The conversation survives app-initiated reloads (the first-visit isolation
 // reload and compatibility-mode recovery) via per-tab sessionStorage.
@@ -419,6 +447,11 @@ function removeErrorCard() {
 }
 
 function loadModel() {
+  // WebLLM has no custom-model/hub test hooks; only route real models to it.
+  if (engineMode === "webllm" && !customModelId && !hubOverride) {
+    loadWebLLM();
+    return;
+  }
   ready = false;
   removeErrorCard();
   const label = customModelId || MODELS[modelSelect.value].label.split(" · ")[0];
@@ -443,7 +476,8 @@ function startGeneration() {
   speedChip.hidden = false;
   speedChip.textContent = "thinking…";
   updateUiState();
-  worker.postMessage({ type: "generate", messages, params: {} });
+  if (engineMode === "webllm") generateWebLLM(messages);
+  else worker.postMessage({ type: "generate", messages, params: {} });
 }
 
 function send(text) {
@@ -496,6 +530,11 @@ function diagnose(failures, diag) {
   }
   if (kinds.has("engine-crash")) {
     lines.push("The AI engine crashed inside this device's graphics or WebAssembly runtime — the app will avoid the crashing configuration from now on.");
+  }
+  if (kinds.has("webllm-failed")) {
+    lines.push("Both in-browser engines failed on this device. The WebGPU (WebLLM) engine reported: " +
+      (failures.find((f) => f.kind === "webllm-failed")?.message || "unknown error") +
+      ". This usually means WebGPU is disabled or broken for this browser — check chrome://gpu, or try a different browser.");
   }
   if (diag.vendorWasm && !diag.vendorWasm.ok) {
     if (diag.jsdelivr && diag.jsdelivr.ok) {
@@ -558,13 +597,13 @@ function showLoadError(failures, diag) {
   errorCard = card;
   // Respawn on retry: a failed wasm init is latched for the worker's lifetime.
   card.querySelector("#retryBtn").addEventListener("click", () => {
-    spawnWorker();
+    if (engineMode !== "webllm") spawnWorker();
     loadModel();
   });
   card.querySelector("#smallestBtn").addEventListener("click", () => {
     modelSelect.value = "smollm2-135m";
     try { localStorage.setItem("localai-model", "smollm2-135m"); } catch {}
-    spawnWorker();
+    if (engineMode !== "webllm") spawnWorker();
     loadModel();
   });
   card.querySelector("#resetBtn").addEventListener("click", async () => {
@@ -612,6 +651,18 @@ async function attemptRecovery(failures, diag) {
     try { await caches.delete("transformers-cache"); } catch {}
     return retry("Cleared cached downloads — retrying…");
   }
+  // The onnxruntime engine crashed on this device (a bare abort code across
+  // every backend/dtype — an onnxruntime kernel failing on this exact browser).
+  // If WebGPU is available, switch straight to the independent WebLLM engine,
+  // which doesn't use onnxruntime at all, rather than re-downloading for more
+  // onnxruntime attempts that will crash the same way.
+  if (kinds.has("engine-crash") && engineMode !== "webllm" && !customModelId && !hubOverride) {
+    if (await hasWebGPU()) {
+      setNote("The standard engine crashed on this device — switching to the WebGPU engine…", true);
+      loadWebLLM();
+      return;
+    }
+  }
   if ((kinds.has("backend") || kinds.has("unknown")) && diag.crossOriginIsolated && !recovery.singleThread) {
     recovery.singleThread = true;
     workerOpts.numThreads = 1;
@@ -647,6 +698,137 @@ async function attemptRecovery(failures, diag) {
     return;
   }
   showLoadError(failures, diag);
+}
+
+// ---- WebLLM engine (WebGPU, on this thread) ----
+// Test-only stand-in for the WebLLM module so the integration (load → stream →
+// done → stop) can be exercised without WebGPU or the real CDN.
+function makeMockWebLLM() {
+  return {
+    async CreateMLCEngine(modelId, opts) {
+      for (let i = 0; i <= 100; i += 25) { opts?.initProgressCallback?.({ progress: i / 100, text: "mock " + modelId }); }
+      return {
+        chat: { completions: { async create() {
+          const words = ["Hello", " from", " the", " WebGPU", " engine", "."];
+          return (async function* () { for (const w of words) { await new Promise((r) => setTimeout(r, 5)); yield { choices: [{ delta: { content: w } }] }; } })();
+        } } },
+        interruptGenerate() {},
+      };
+    },
+  };
+}
+
+async function loadWebLLM() {
+  engineMode = "webllm";
+  ready = false;
+  removeErrorCard();
+  const name = MODELS[modelSelect.value].label.split(" · ")[0];
+  showLoader("Loading " + name + " on the WebGPU engine…");
+  deviceChip.textContent = "WebGPU (WebLLM)";
+  deviceChip.className = "chip ok";
+  updateUiState();
+  try {
+    const webllm = params.get("webllmmock") ? makeMockWebLLM() : await import(/* @vite-ignore */ WEBLLM_CDN);
+    const modelId = WEBLLM_MODELS[modelSelect.value] || WEBLLM_MODELS[DEFAULT_MODEL];
+    webllmEngine = await webllm.CreateMLCEngine(modelId, {
+      initProgressCallback: (p) => {
+        const pct = Math.round((p.progress || 0) * 100);
+        $("barfill").style.width = pct + "%";
+        $("loadPct").textContent = pct + "%";
+        $("loadDetail").textContent = (p.text || "Loading…").slice(0, 80);
+      },
+    });
+    lastWasmSource = "webllm";
+    window.__engine = "webllm";
+    ready = true;
+    loaderEl.hidden = true;
+    removeErrorCard();
+    try { localStorage.setItem("localai-engine", "webllm"); } catch {}
+    updateUiState();
+    if (awaitingModel && history.length && history[history.length - 1].role === "user") {
+      startGeneration();
+    } else {
+      setNote("Running on the WebGPU engine (WebLLM).");
+      inputEl.focus();
+    }
+  } catch (err) {
+    webllmEngine = null;
+    // WebLLM couldn't start either — surface it with full context. Don't loop
+    // back to the onnxruntime engine (it already failed on this device).
+    showLoadError(
+      [{ device: "webgpu", dtype: "q4f16", kind: "webllm-failed", message: String(err && err.message || err) }],
+      { engine: "webllm", crossOriginIsolated: !!self.crossOriginIsolated,
+        webgpuAdapter: webgpuOk, userAgent: navigator.userAgent }
+    );
+  }
+}
+
+async function generateWebLLM(messages) {
+  webllmStop = false;
+  let text = "";
+  let tokens = 0;
+  let firstAt = 0;
+  try {
+    const stream = await webllmEngine.chat.completions.create({
+      messages,
+      stream: true,
+      temperature: 0.6,
+      top_p: 0.9,
+      max_tokens: 512,
+    });
+    for await (const chunk of stream) {
+      if (webllmStop) break;
+      const delta = chunk.choices?.[0]?.delta?.content || "";
+      if (delta) {
+        if (!firstAt) firstAt = performance.now();
+        tokens += 1;
+        const tps = firstAt ? tokens / ((performance.now() - firstAt) / 1000) : 0;
+        streamToken(delta, tps);
+      }
+    }
+    finishReply(text || currentText, {
+      tokens,
+      tps: firstAt ? tokens / ((performance.now() - firstAt) / 1000) : 0,
+    });
+  } catch (err) {
+    generating = false;
+    speedChip.hidden = true;
+    if (currentBubble) { currentBubble.parentElement?.remove(); currentBubble = null; }
+    addBubble("bot", "⚠️ The WebGPU engine failed while replying: " +
+      String(err && err.message || err) + "\n\nTry a smaller model, or reload the page.");
+    setNote("Generation failed — try a smaller model.", true);
+    updateUiState();
+  }
+}
+
+// Shared streaming/finalize used by both engines.
+function streamToken(chunk, tps) {
+  currentText += chunk;
+  if (currentBubble) {
+    currentBubble.innerHTML = render(currentText) + '<span class="cursor"></span>';
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+  if (tps > 0) speedChip.textContent = tps.toFixed(1) + " tok/s";
+}
+
+function finishReply(text, stats) {
+  const finalText = (text || currentText).trim() || "(no response — try again)";
+  if (currentBubble) {
+    currentBubble.innerHTML = render(finalText);
+    if (stats) {
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = stats.tokens + " tokens · " + stats.tps.toFixed(1) + " tok/s";
+      currentBubble.appendChild(meta);
+    }
+  }
+  history.push({ role: "assistant", content: finalText });
+  saveConvo();
+  generating = false;
+  currentBubble = null;
+  speedChip.hidden = true;
+  updateUiState();
+  chatEl.scrollTop = chatEl.scrollHeight;
 }
 
 function handleWorkerMessage(e) {
@@ -695,30 +877,11 @@ function handleWorkerMessage(e) {
       break;
     }
     case "token": {
-      currentText += msg.text;
-      if (currentBubble) {
-        currentBubble.innerHTML = render(currentText) + '<span class="cursor"></span>';
-        chatEl.scrollTop = chatEl.scrollHeight;
-      }
-      if (msg.tps > 0) speedChip.textContent = msg.tps.toFixed(1) + " tok/s";
+      streamToken(msg.text, msg.tps);
       break;
     }
     case "done": {
-      const finalText = (msg.text || currentText).trim() || "(no response — try again)";
-      if (currentBubble) {
-        currentBubble.innerHTML = render(finalText);
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        meta.textContent = msg.stats.tokens + " tokens · " + msg.stats.tps.toFixed(1) + " tok/s";
-        currentBubble.appendChild(meta);
-      }
-      history.push({ role: "assistant", content: finalText });
-      saveConvo();
-      generating = false;
-      currentBubble = null;
-      speedChip.hidden = true;
-      updateUiState();
-      chatEl.scrollTop = chatEl.scrollHeight;
+      finishReply(msg.text, msg.stats);
       break;
     }
     case "generate-failed": {
@@ -729,18 +892,27 @@ function handleWorkerMessage(e) {
         currentBubble = null;
       }
       if (!genRetryUsed) {
-        // One automatic recovery per message: reload the model in a fresh
-        // worker on a safer configuration and answer the message again.
+        // One automatic recovery per message: reload on a safer configuration
+        // and answer the message again.
         genRetryUsed = true;
         delete workerOpts.testCrashGenerate;
-        if (msg.device === "webgpu") {
-          workerOpts.forceWasm = true;
-          try { localStorage.setItem("localai-force-wasm", "1"); } catch {}
-        }
         awaitingModel = true;
-        setNote("The AI engine crashed mid-reply — restarting in a safer mode and retrying…", true);
-        spawnWorker();
-        loadModel();
+        // If the onnxruntime engine crashed and WebGPU exists, jump to WebLLM;
+        // otherwise fall back from GPU to CPU within the onnxruntime engine.
+        hasWebGPU().then((gpu) => {
+          if (gpu && engineMode !== "webllm" && !customModelId && !hubOverride) {
+            setNote("The engine crashed — switching to the WebGPU engine (WebLLM)…", true);
+            loadWebLLM();
+          } else {
+            if (msg.device === "webgpu") {
+              workerOpts.forceWasm = true;
+              try { localStorage.setItem("localai-force-wasm", "1"); } catch {}
+            }
+            setNote("The AI engine crashed mid-reply — restarting in a safer mode and retrying…", true);
+            spawnWorker();
+            loadModel();
+          }
+        });
         break;
       }
       const human = /^\d+$/.test((msg.message || "").trim())
@@ -777,16 +949,23 @@ function handleWorkerError(e) {
     currentBubble = null;
   }
   // A whole-worker crash (an async engine failure no promise caught): recover
-  // once automatically on the safest settings instead of dead-ending.
+  // once automatically instead of dead-ending — prefer the WebLLM engine when
+  // WebGPU is available, else the safest onnxruntime settings.
   if (!recovery.workerCrashRetried) {
     recovery.workerCrashRetried = true;
-    workerOpts.forceWasm = true;
-    workerOpts.numThreads = 1;
     delete workerOpts.testCrashGenerate;
     delete workerOpts.testCrashLoad;
-    spawnWorker();
-    loadModel();
-    $("loadTitle").textContent = "The engine crashed — restarting in a safer mode…";
+    hasWebGPU().then((gpu) => {
+      if (gpu && engineMode !== "webllm" && !customModelId && !hubOverride) {
+        loadWebLLM();
+      } else {
+        workerOpts.forceWasm = true;
+        workerOpts.numThreads = 1;
+        spawnWorker();
+        loadModel();
+        $("loadTitle").textContent = "The engine crashed — restarting in a safer mode…";
+      }
+    });
     return;
   }
   engineDead = true;
@@ -801,7 +980,14 @@ function handleWorkerError(e) {
 }
 
 sendBtn.addEventListener("click", () => send());
-stopBtn.addEventListener("click", () => worker.postMessage({ type: "stop" }));
+stopBtn.addEventListener("click", () => {
+  if (engineMode === "webllm") {
+    webllmStop = true;
+    try { webllmEngine?.interruptGenerate?.(); } catch {}
+  } else {
+    worker.postMessage({ type: "stop" });
+  }
+});
 clearBtn.addEventListener("click", () => {
   history = [];
   awaitingModel = false;
@@ -815,7 +1001,8 @@ modelSelect.addEventListener("change", () => {
   // Respawn so an in-flight load of the previous model can't race this one
   // (two concurrent load() calls in one worker let the abandoned model win).
   // awaitingModel is kept: a queued message is answered by the new model.
-  spawnWorker();
+  if (engineMode === "webllm") { webllmEngine = null; }
+  else spawnWorker();
   loadModel();
 });
 inputEl.addEventListener("input", () => {
@@ -856,7 +1043,15 @@ heroEl.addEventListener("click", (e) => {
 
 console.log("LocalAI " + APP_VERSION);
 setNote(null);
-loadModel();
+// If a prior session pinned the WebLLM engine but this browser has no WebGPU,
+// fall back to the standard engine rather than failing on load.
+(async () => {
+  if (engineMode === "webllm" && !(await hasWebGPU())) {
+    engineMode = "transformers";
+    try { localStorage.removeItem("localai-engine"); } catch {}
+  }
+  loadModel();
+})();
 </script>
 </body>
 </html>
