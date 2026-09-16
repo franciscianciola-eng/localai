@@ -220,7 +220,47 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
-// ---------- Test 6: heavy model crashes at load -> auto step-down to smaller ----------
+// ---------- Test 6: a GPU-only model routes to WebLLM when WebGPU is present ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => { try { localStorage.setItem("localai-model", "phi35-mini"); } catch {} });
+  const page = await ctx.newPage();
+  // webllmmock makes hasWebGPU() true and swaps in the fake WebLLM module.
+  await page.goto(`http://localhost:${PORT}/?webllmmock=1`, { waitUntil: "load" });
+  await page.fill("#input", "hello big model");
+  await page.press("#input", "Enter");
+  const replied = await page
+    .waitForSelector(".msg.bot .bubble .meta", { timeout: 30000 })
+    .then(() => true)
+    .catch(() => false);
+  check("GPU-only model routes to WebLLM and replies", replied);
+  if (replied) {
+    const eng = await page.evaluate(() => window.__engine);
+    check("GPU-only model used the webllm engine", eng === "webllm", String(eng));
+  }
+  await ctx.close();
+}
+
+// ---------- Test 7: a GPU-only model without WebGPU shows a clear message ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => { try { localStorage.setItem("localai-model", "gemma2-2b"); } catch {} });
+  const page = await ctx.newPage();
+  // No webllmmock: headless Chromium has no WebGPU adapter, so this must fail cleanly.
+  await page.goto(`http://localhost:${PORT}/`, { waitUntil: "load" });
+  const cardShown = await page
+    .waitForSelector(".card.error", { timeout: 30000 })
+    .then(() => true)
+    .catch(() => false);
+  check("GPU-only model without WebGPU shows the error card", cardShown);
+  if (cardShown) {
+    const text = await page.textContent(".card.error");
+    check("message explains WebGPU is needed", /needs WebGPU/i.test(text), text.slice(0, 160));
+  }
+  await ctx.close();
+}
+
+// ---------- Test 8: heavy model crashes at load -> auto step-down to smaller ----------
 {
   const context = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await context.addInitScript(() => {

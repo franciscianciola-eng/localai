@@ -253,7 +253,11 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v8"; // bump on every push — shown in the footer
+const APP_VERSION = "v9"; // bump on every push — shown in the footer
+// Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
+// ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
+// (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
+// gpu-only models don't need one.
 const MODELS = {
   "smollm2-135m": {
     id: "onnx-community/SmolLM2-135M-Instruct-ONNX",
@@ -265,11 +269,23 @@ const MODELS = {
   },
   "qwen25-05b": {
     id: "onnx-community/Qwen2.5-0.5B-Instruct",
-    label: "Qwen2.5 0.5B · smartest (~0.5 GB)",
+    label: "Qwen2.5 0.5B · smartest small model (~0.5 GB)",
+  },
+  "llama32-1b": {
+    gpu: true,
+    label: "Llama 3.2 · 1B · needs WebGPU (~0.9 GB)",
+  },
+  "gemma2-2b": {
+    gpu: true,
+    label: "Gemma 2 · 2B · needs WebGPU (~1.6 GB)",
+  },
+  "phi35-mini": {
+    gpu: true,
+    label: "Phi-3.5 mini · 3.8B (closest to 5B) · needs WebGPU (~2.3 GB)",
   },
 };
 // Heaviest → lightest, for automatic step-down when a model won't run.
-const MODEL_ORDER = ["qwen25-05b", "smollm2-360m", "smollm2-135m"];
+const MODEL_ORDER = ["phi35-mini", "gemma2-2b", "llama32-1b", "qwen25-05b", "smollm2-360m", "smollm2-135m"];
 const DEFAULT_MODEL = "smollm2-135m";
 
 // WebLLM (MLC) is a second, independent in-browser engine built on Apache TVM
@@ -281,6 +297,9 @@ const WEBLLM_MODELS = {
   "smollm2-135m": "SmolLM2-135M-Instruct-q0f16-MLC",
   "smollm2-360m": "SmolLM2-360M-Instruct-q4f16_1-MLC",
   "qwen25-05b": "Qwen2.5-0.5B-Instruct-q4f16_1-MLC",
+  "llama32-1b": "Llama-3.2-1B-Instruct-q4f16_1-MLC",
+  "gemma2-2b": "gemma-2-2b-it-q4f16_1-MLC",
+  "phi35-mini": "Phi-3.5-mini-instruct-q4f16_1-MLC",
 };
 const SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
@@ -446,11 +465,30 @@ function removeErrorCard() {
   if (errorCard) { errorCard.remove(); errorCard = null; }
 }
 
-function loadModel() {
-  // WebLLM has no custom-model/hub test hooks; only route real models to it.
-  if (engineMode === "webllm" && !customModelId && !hubOverride) {
-    loadWebLLM();
-    return;
+async function loadModel() {
+  const sel = customModelId ? null : MODELS[modelSelect.value];
+  const gpuOnly = !!(sel && sel.gpu);
+  // Route to the WebGPU (WebLLM) engine for GPU-only models, or when this
+  // device already switched to WebLLM. Test hooks (custom model / hub) always
+  // use the transformers.js path.
+  if (!customModelId && !hubOverride && (gpuOnly || engineMode === "webllm")) {
+    if (!(await hasWebGPU())) {
+      if (gpuOnly) {
+        showLoadError(
+          [{ device: "webgpu", dtype: "q4f16", kind: "no-webgpu",
+             message: "This model needs WebGPU, which isn't available in this browser." }],
+          { webgpuAdapter: false, crossOriginIsolated: !!self.crossOriginIsolated, userAgent: navigator.userAgent }
+        );
+        return;
+      }
+      // A non-GPU model while pinned to WebLLM but WebGPU vanished: use the CPU engine.
+      engineMode = "transformers";
+      try { localStorage.removeItem("localai-engine"); } catch {}
+    } else {
+      engineMode = "webllm";
+      loadWebLLM();
+      return;
+    }
   }
   ready = false;
   removeErrorCard();
@@ -532,9 +570,13 @@ function diagnose(failures, diag) {
     lines.push("The AI engine crashed inside this device's graphics or WebAssembly runtime — the app will avoid the crashing configuration from now on.");
   }
   if (kinds.has("webllm-failed")) {
-    lines.push("Both in-browser engines failed on this device. The WebGPU (WebLLM) engine reported: " +
+    lines.push("The WebGPU (WebLLM) engine reported: " +
       (failures.find((f) => f.kind === "webllm-failed")?.message || "unknown error") +
-      ". This usually means WebGPU is disabled or broken for this browser — check chrome://gpu, or try a different browser.");
+      ". A large model may be too big for this device's GPU — try a smaller one; or WebGPU may be disabled (check chrome://gpu).");
+  }
+  if (kinds.has("no-webgpu")) {
+    lines.push("This model needs WebGPU, which isn't available in this browser. " +
+      "Pick one of the small models (135M–0.5B) that run on the CPU, or enable WebGPU (Chrome 113+, chrome://gpu).");
   }
   if (diag.vendorWasm && !diag.vendorWasm.ok) {
     if (diag.jsdelivr && diag.jsdelivr.ok) {

@@ -63,14 +63,31 @@ what each probe found — paste it into an issue if you're stuck.
 All models are public, permissively licensed (Apache-2.0) open weights,
 downloaded directly from Hugging Face and quantized to 4/8-bit ONNX for speed:
 
+**Small models** (run on any device — WebGPU *or* CPU/WASM):
+
 | Model | Download | Best for |
 |---|---|---|
 | [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) *(default)* | ~0.1 GB | Runs on anything — the safe default |
 | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~0.3 GB | Best speed/coherence balance |
-| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~0.5 GB | Smartest answers |
+| [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~0.5 GB | Smartest small model |
+
+**Large models** (need **WebGPU**; run on the WebLLM engine only — much smarter,
+much larger downloads, and a capable GPU helps):
+
+| Model | Params | Download | Notes |
+|---|---|---|---|
+| [Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) | 1B | ~0.9 GB | Solid all-rounder |
+| [Gemma-2-2B-it](https://huggingface.co/google/gemma-2-2b-it) | 2B | ~1.6 GB | Strong 2B model |
+| [Phi-3.5-mini-instruct](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | 3.8B | ~2.3 GB | Closest browser-runnable model to 5B* |
+
+\* There's no widely-available ~5B open model in a browser-ready format;
+Phi-3.5-mini (3.8B) is the nearest that runs reliably in-browser. Bigger
+options (Qwen2.5-7B, Llama-3.1-8B) exist and can be added, but need a lot of
+GPU memory.
 
 Switch models from the dropdown in the header; each is cached after its first
-download.
+download. The large models load through WebGPU — if your browser has no WebGPU,
+the app tells you and points you back to the small models.
 
 ## Two engines for maximum compatibility
 
