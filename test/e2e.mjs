@@ -38,6 +38,17 @@ const server = http.createServer(async (req, res) => {
       query: { pages: { "1": { index: 1, title: "Photosynthesis", extract: "CANARYTOKEN123 Plants make food from light." } } },
     }));
   }
+  // A stand-in CORS proxy returning canned DuckDuckGo HTML for the full-web path.
+  if (p === "/proxy") {
+    const target = new URLSearchParams(req.url.split("?")[1] || "").get("url") || "";
+    res.writeHead(200, { "content-type": "text/html", "access-control-allow-origin": "*" });
+    if (/duckduckgo/.test(target)) {
+      return res.end('<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=' +
+        encodeURIComponent("https://example.com/news") + '">Big News Today</a>' +
+        '<div class="result__snippet">WEBCANARY42 the latest headline from the web.</div></div>');
+    }
+    return res.end("<html></html>");
+  }
   // A stand-in CDN mirror serving the vendored runtime files (used to test the
   // fallback when the host itself refuses to serve the big wasm).
   if (p.startsWith("/cdnmirror/")) {
@@ -83,7 +94,7 @@ const check = (name, cond, extra = "") => {
   page.on("console", (m) => logs.push(`[${m.type()}] ${m.text()}`));
   page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
 
-  const url = `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`;
+  const url = `http://localhost:${PORT}/?cpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`;
   await page.goto(url, { waitUntil: "load" });
 
   // Type immediately — exercises "typing always works" + the message queue
@@ -131,7 +142,7 @@ const check = (name, cond, extra = "") => {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   // Default models point at huggingface.co, which this environment blocks —
   // exactly the school-network scenario the diagnosis exists for.
-  await page.goto(`http://localhost:${PORT}/`, { waitUntil: "load" });
+  await page.goto(`http://localhost:${PORT}/?cpu=1&nogpu=1`, { waitUntil: "load" });
   const cardShown = await page
     .waitForSelector(".card.error", { timeout: 60000 })
     .then(() => true)
@@ -154,7 +165,7 @@ const check = (name, cond, extra = "") => {
 {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   await page.goto(
-    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/&crashgen=1`,
+    `http://localhost:${PORT}/?cpu=1&nogpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hub/&crashgen=1`,
     { waitUntil: "load" }
   );
   await page.fill("#input", "Crash then recover");
@@ -183,7 +194,7 @@ const check = (name, cond, extra = "") => {
   // vendorblocked=1 simulates the host's 403 on the big wasm; wasmcdn points the
   // CDN fallback at a local mirror so the whole thing runs offline.
   await page.goto(
-    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/` +
+    `http://localhost:${PORT}/?cpu=1&nogpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hub/` +
     `&vendorblocked=1&wasmcdn=http://localhost:${PORT}/cdnmirror/`,
     { waitUntil: "load" }
   );
@@ -253,8 +264,9 @@ const check = (name, cond, extra = "") => {
   const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await ctx.addInitScript(() => { try { localStorage.setItem("localai-model", "gemma2-2b"); } catch {} });
   const page = await ctx.newPage();
-  // No webllmmock: headless Chromium has no WebGPU adapter, so this must fail cleanly.
-  await page.goto(`http://localhost:${PORT}/`, { waitUntil: "load" });
+  // nogpu forces the "no WebGPU" path deterministically (headless may expose a
+  // flaky SwiftShader adapter otherwise).
+  await page.goto(`http://localhost:${PORT}/?nogpu=1`, { waitUntil: "load" });
   const cardShown = await page
     .waitForSelector(".card.error", { timeout: 30000 })
     .then(() => true)
@@ -323,14 +335,16 @@ const check = (name, cond, extra = "") => {
 
 // ---------- Test 10: settings panel opens, toggles persist, theme applies ----------
 {
-  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
-  await page.goto(`http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`, { waitUntil: "load" });
+  // Isolated context so the settings written here don't leak into other tests.
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  const page = await ctx.newPage();
+  await page.goto(`http://localhost:${PORT}/?cpu=1&nogpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`, { waitUntil: "load" });
   await page.click("#settingsBtn");
   check("settings modal opens", await page.isVisible(".modal"));
-  // Toggle web search on (click the visible slider) and confirm it persists.
-  await page.click("#setWebSearch + .slider");
-  const persisted = await page.evaluate(() => JSON.parse(localStorage.getItem("localai-settings") || "{}").webSearch);
-  check("web search toggle persists", persisted === true);
+  // Set web search to "always" and confirm it persists.
+  await page.click('#setSearchMode button[data-v="always"]');
+  const persisted = await page.evaluate(() => JSON.parse(localStorage.getItem("localai-settings") || "{}").searchMode);
+  check("web search mode persists", persisted === "always", String(persisted));
   check("header shows the web-search indicator", await page.isVisible("#searchNote"));
   // Dark theme applies immediately.
   await page.click('#setTheme button[data-v="dark"]');
@@ -338,17 +352,18 @@ const check = (name, cond, extra = "") => {
   check("dark theme applied", theme === "dark", String(theme));
   await page.click("#settingsClose");
   check("settings modal closes", !(await page.isVisible(".modal")));
-  await page.close();
+  await ctx.close();
 }
 
-// ---------- Test 11: web search injects Wikipedia context into the prompt ----------
+// ---------- Test 11: "always" mode injects full-web + Wikipedia context ----------
 {
   const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await ctx.addInitScript(() => {
-    try { localStorage.setItem("localai-settings", JSON.stringify({ webSearch: true })); } catch {}
+    try { localStorage.setItem("localai-settings", JSON.stringify({ searchMode: "always" })); } catch {}
   });
   const page = await ctx.newPage();
-  await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1&searchapi=http://localhost:${PORT}/wikiapi`, { waitUntil: "load" });
+  await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1` +
+    `&searchapi=http://localhost:${PORT}/wikiapi&proxy=http://localhost:${PORT}/proxy?url=%s`, { waitUntil: "load" });
   await page.fill("#input", "how do plants eat");
   await page.press("#input", "Enter");
   const replied = await page
@@ -358,10 +373,38 @@ const check = (name, cond, extra = "") => {
   check("reply completes with web search on", replied);
   if (replied) {
     const msgs = await page.evaluate(() => JSON.stringify(window.__mockLastMessages || []));
-    check("Wikipedia context was injected into the prompt", msgs.includes("CANARYTOKEN123"), msgs.slice(0, 120));
+    check("full-web (DuckDuckGo) context injected", msgs.includes("WEBCANARY42"), msgs.slice(0, 160));
+    check("Wikipedia context also injected", msgs.includes("CANARYTOKEN123"));
     const src = await page.textContent("#messages");
-    check("search sources shown in the chat", /Web search.*Photosynthesis/s.test(src));
+    check("search sources shown in the chat", /Searched the web/s.test(src));
   }
+  await ctx.close();
+}
+
+// ---------- Test 11b: "smart" mode makes a conscious decision (no useless search) ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  await ctx.addInitScript(() => {
+    try { localStorage.setItem("localai-settings", JSON.stringify({ searchMode: "smart" })); } catch {}
+  });
+  const page = await ctx.newPage();
+  await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1` +
+    `&searchapi=http://localhost:${PORT}/wikiapi&proxy=http://localhost:${PORT}/proxy?url=%s`, { waitUntil: "load" });
+
+  // A greeting: the heuristic says no search — nothing should be fetched.
+  await page.fill("#input", "hey there");
+  await page.press("#input", "Enter");
+  await page.waitForSelector(".msg.bot .bubble .meta", { timeout: 30000 }).catch(() => {});
+  let msgs = await page.evaluate(() => JSON.stringify(window.__mockLastMessages || []));
+  check("smart mode does NOT search a greeting", !msgs.includes("WEBCANARY42") && !msgs.includes("CANARYTOKEN123"));
+  check("no search-sources line for the greeting", !(await page.textContent("#messages")).includes("Searched the web"));
+
+  // A clearly time-sensitive question: the heuristic says search.
+  await page.fill("#input", "what is the latest news on mars");
+  await page.press("#input", "Enter");
+  await page.waitForFunction(() => document.querySelectorAll(".msg.bot .bubble .meta").length >= 2, { timeout: 30000 }).catch(() => {});
+  msgs = await page.evaluate(() => JSON.stringify(window.__mockLastMessages || []));
+  check("smart mode DOES search a time-sensitive question", msgs.includes("WEBCANARY42") || msgs.includes("CANARYTOKEN123"), msgs.slice(0, 160));
   await ctx.close();
 }
 
@@ -373,7 +416,7 @@ const check = (name, cond, extra = "") => {
   });
   const page = await context.newPage();
   await page.goto(
-    `http://localhost:${PORT}/?hub=http://localhost:${PORT}/hub/&crashload=1`,
+    `http://localhost:${PORT}/?cpu=1&nogpu=1&hub=http://localhost:${PORT}/hub/&crashload=1`,
     { waitUntil: "load" }
   );
   // Every load attempt for the selected 360M model crashes (test hook); the
@@ -402,7 +445,7 @@ const check = (name, cond, extra = "") => {
 {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   await page.goto(
-    `http://localhost:${PORT}/?modelId=tiny-llm&hub=http://localhost:${PORT}/hubblock/`,
+    `http://localhost:${PORT}/?cpu=1&nogpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hubblock/`,
     { waitUntil: "load" }
   );
   const cardShown = await page

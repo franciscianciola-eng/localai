@@ -292,13 +292,20 @@
 
       <div class="setting">
         <div class="top">
-          <div>
-            <div class="name">Web search</div>
-            <div class="desc warn">Off by default. When on, your message is sent to Wikipedia's public API
-              to fetch relevant facts the model can use. This is the only time anything leaves your device.</div>
+          <div class="name">Web search</div>
+          <div class="segmented" id="setSearchMode">
+            <button data-v="off">Off</button>
+            <button data-v="smart">Smart</button>
+            <button data-v="always">Always</button>
           </div>
-          <label class="switch"><input type="checkbox" id="setWebSearch"><span class="slider"></span></label>
         </div>
+        <div class="desc warn">Off by default. <b>Smart</b>: the model decides for itself whether a search is needed
+          (no useless searches). <b>Always</b>: search every message. When it searches, your query is sent to
+          DuckDuckGo &amp; Wikipedia (full web via a relay) — the only time anything leaves your device.</div>
+        <input type="text" id="setProxy" placeholder="Optional: your own CORS proxy URL (use %s for the target)"
+          style="width:100%;margin-top:8px;font:inherit;color:var(--text);background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
+        <div class="desc">Full-web fetches route through a public CORS relay (a browser can't read arbitrary sites
+          directly). Public relays can be slow or down; paste your own here for reliability/privacy. Wikipedia works without one.</div>
       </div>
 
       <div class="setting">
@@ -401,7 +408,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v11"; // bump on every push — shown in the footer
+const APP_VERSION = "v12"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
@@ -483,7 +490,8 @@ const hubOverride = params.get("hub");       // test hook: alternate weights hos
 const SEARCH_ENDPOINT = params.get("searchapi") || "https://en.wikipedia.org/w/api.php";
 
 const SETTINGS_DEFAULTS = {
-  webSearch: false,   // OFF by default — the only feature that sends data out
+  searchMode: "off",  // off | smart (model decides) | always — OFF by default
+  proxy: "",          // optional custom CORS proxy for full-web fetches
   maxTokens: 512,
   temperature: 0.6,
   perfMode: "auto",   // auto | full | eco | lowpower
@@ -494,8 +502,16 @@ const SETTINGS_DEFAULTS = {
 let settings = { ...SETTINGS_DEFAULTS };
 try {
   const saved = JSON.parse(localStorage.getItem("localai-settings") || "{}");
-  settings = { ...SETTINGS_DEFAULTS, ...(saved && typeof saved === "object" ? saved : {}) };
+  if (saved && typeof saved === "object") {
+    // Migrate the old boolean webSearch flag → the new three-way mode.
+    if (saved.searchMode === undefined && saved.webSearch !== undefined) {
+      saved.searchMode = saved.webSearch ? "smart" : "off";
+    }
+    delete saved.webSearch;
+    settings = { ...SETTINGS_DEFAULTS, ...saved };
+  }
 } catch {}
+if (params.get("proxy")) settings.proxy = params.get("proxy"); // test hook
 function saveSettings() {
   try { localStorage.setItem("localai-settings", JSON.stringify(settings)); } catch {}
 }
@@ -547,6 +563,7 @@ let webllmCrashCount = 0; // per-message escalation guard
 window.__throttle = throttleLevel;
 
 async function hasWebGPU() {
+  if (params.get("nogpu")) return false;     // test hook
   if (params.get("webllmmock")) return true; // test hook
   if (webgpuOk !== null) return webgpuOk;
   try {
@@ -671,6 +688,7 @@ if (params.get("crashgen")) workerOpts.testCrashGenerate = true; // test hook
 if (params.get("crashload")) workerOpts.testCrashLoad = true;    // test hook
 if (params.get("vendorblocked")) workerOpts.vendorBlocked = true; // test hook
 if (params.get("wasmcdn")) workerOpts.wasmCdn = params.get("wasmcdn"); // test hook
+if (params.get("cpu")) workerOpts.forceWasm = true;             // test hook: skip WebGPU
 
 function spawnWorker() {
   if (worker) worker.terminate();
@@ -678,6 +696,19 @@ function spawnWorker() {
   worker = new Worker("./worker.js", { type: "module" });
   worker.addEventListener("message", handleWorkerMessage);
   worker.addEventListener("error", handleWorkerError);
+}
+
+// One-shot classification on the worker engine (for the search decision).
+let classifyId = 0;
+const classifyResolvers = {};
+function workerClassify(messages, maxTokens) {
+  if (!worker) return Promise.resolve("");
+  return new Promise((resolve) => {
+    const id = ++classifyId;
+    classifyResolvers[id] = resolve;
+    setTimeout(() => { if (classifyResolvers[id]) { delete classifyResolvers[id]; resolve(""); } }, 15000);
+    worker.postMessage({ type: "classify", messages, id, maxTokens });
+  });
 }
 
 function fmtMB(bytes) { return (bytes / 1048576).toFixed(0) + " MB"; }
@@ -798,18 +829,30 @@ async function startGeneration() {
   const recent = history.slice(-12);
   const msgs = [{ role: "system", content: systemPrompt() }];
 
-  // Optional web-search grounding: fetch relevant facts and give them to the
-  // model as an extra system message before it answers.
-  if (settings.webSearch) {
+  // Optional web-search grounding. In "smart" mode the model makes a conscious
+  // decision about whether a search is actually needed (no useless searches);
+  // in "always" mode it searches every turn.
+  if (settings.searchMode !== "off") {
     const lastUser = [...history].reverse().find((m) => m.role === "user");
     if (lastUser) {
-      const found = await webSearch(lastUser.content).catch(() => null);
-      if (found && found.context) {
-        msgs.push({
-          role: "system",
-          content: "Relevant information from a web search (Wikipedia). Use it if helpful:\n\n" + found.context,
-        });
-        showSearchSources(found.sources);
+      let doSearch = true;
+      let query = lastUser.content;
+      if (settings.searchMode === "smart") {
+        speedChip.textContent = "deciding…";
+        const d = await decideSearch(lastUser.content).catch(() => ({ search: false }));
+        doSearch = d.search;
+        if (d.query) query = d.query;
+      }
+      if (doSearch) {
+        speedChip.textContent = "searching the web…";
+        const found = await webSearch(query).catch(() => null);
+        if (found && found.context) {
+          msgs.push({
+            role: "system",
+            content: "Up-to-date information from a web search. Use it to answer accurately; if you rely on it, note that it came from the web:\n\n" + found.context,
+          });
+          showSearchSources(found.sources, query);
+        }
       }
     }
   }
@@ -1051,46 +1094,149 @@ async function attemptRecovery(failures, diag) {
   showLoadError(failures, diag);
 }
 
-// ---- Optional web search (Wikipedia, CORS-enabled, no API key) ----
-// The "internet sandbox": read-only public Wikipedia content, fetched with a
-// single CORS request. Off by default; only runs when the setting is on.
-async function webSearch(query) {
-  const q = (query || "").slice(0, 300);
-  if (!q) return null;
-  const low = effectiveThrottle() >= 2; // keep the prompt tiny in low-power mode
+// ---- Web search ----
+// Full-web search needs a CORS proxy (a browser can't read arbitrary sites
+// directly). We try the user's proxy first, then public fallbacks, and always
+// also query Wikipedia directly (no proxy needed) so results still appear if
+// every proxy is down. Off by default.
+const CORS_PROXIES = [
+  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+  (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
+  (u) => "https://thingproxy.freeboard.io/fetch/" + u,
+];
+function proxyBuilders() {
+  const custom = (settings.proxy || "").trim();
+  if (!custom) return CORS_PROXIES;
+  const b = custom.includes("%s")
+    ? (u) => custom.replace("%s", encodeURIComponent(u))
+    : (u) => custom + encodeURIComponent(u);
+  return [b, ...CORS_PROXIES];
+}
+async function proxiedFetch(url) {
+  let lastErr;
+  for (const build of proxyBuilders()) {
+    try {
+      const r = await fetch(build(url), { cache: "no-store" });
+      if (r.ok) { const t = await r.text(); if (t) return t; }
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr || new Error("all proxies failed");
+}
+function domainOf(u) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } }
+// DuckDuckGo HTML links wrap the real URL in a redirect (…/l/?uddg=<enc>).
+function unwrapDdg(href) {
+  try {
+    if (!href) return "";
+    if (href.startsWith("//")) href = "https:" + href;
+    const u = new URL(href, "https://duckduckgo.com");
+    const uddg = u.searchParams.get("uddg");
+    return uddg ? decodeURIComponent(uddg) : href;
+  } catch { return href || ""; }
+}
+async function webSearchFull(query) {
+  const html = await proxiedFetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query));
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const out = [];
+  doc.querySelectorAll(".result, .web-result").forEach((el) => {
+    const a = el.querySelector("a.result__a");
+    const snip = el.querySelector(".result__snippet");
+    if (a && a.textContent.trim()) {
+      out.push({ title: a.textContent.trim(), url: unwrapDdg(a.getAttribute("href")), snippet: snip ? snip.textContent.trim() : "" });
+    }
+  });
+  return out.slice(0, 5);
+}
+async function wikiSearch(query) {
   const url = SEARCH_ENDPOINT +
-    "?action=query&generator=search&gsrsearch=" + encodeURIComponent(q) +
-    "&gsrlimit=2&prop=extracts&exintro=1&explaintext=1&exsectionformat=plain" +
-    "&exchars=" + (low ? 350 : 700) + "&format=json&origin=*";
+    "?action=query&generator=search&gsrsearch=" + encodeURIComponent(query) +
+    "&gsrlimit=2&prop=extracts&exintro=1&explaintext=1&exsectionformat=plain&exchars=500&format=json&origin=*";
   const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) return null;
+  if (!res.ok) return [];
   const data = await res.json();
   const pages = data?.query?.pages ? Object.values(data.query.pages) : [];
   pages.sort((a, b) => (a.index || 0) - (b.index || 0));
-  const cap = low ? 700 : 1500;
+  return pages.filter((p) => p.extract).map((p) => ({
+    title: p.title, url: "https://en.wikipedia.org/wiki/" + encodeURIComponent(p.title.replace(/ /g, "_")), snippet: p.extract.trim(),
+  }));
+}
+// Run the full-web and Wikipedia searches together; merge into grounding text.
+async function webSearch(query) {
+  const q = (query || "").slice(0, 300);
+  if (!q) return null;
+  const low = effectiveThrottle() >= 2;
+  const cap = low ? 900 : 2000;
+  const [web, wiki] = await Promise.allSettled([webSearchFull(q), wikiSearch(q)]);
+  const results = []
+    .concat(web.status === "fulfilled" ? web.value : [])
+    .concat(wiki.status === "fulfilled" ? wiki.value : []);
+  if (!results.length) return null;
+  const seen = new Set();
   const sources = [];
   let context = "";
-  for (const p of pages) {
-    if (!p.extract) continue;
-    sources.push(p.title);
-    context += p.title + ": " + p.extract.trim() + "\n\n";
-    if (context.length > cap) break;
+  for (const r of results) {
+    const key = (r.url || r.title).toLowerCase();
+    if (seen.has(key) || !r.snippet) continue;
+    seen.add(key);
+    const dom = domainOf(r.url);
+    context += r.title + (dom ? " (" + dom + ")" : "") + ": " + r.snippet + "\n\n";
+    sources.push({ title: r.title, url: r.url, dom });
+    if (context.length > cap || sources.length >= 5) break;
   }
   context = context.slice(0, cap).trim();
   return context ? { context, sources } : null;
 }
 
-function showSearchSources(sources) {
-  if (!sources || !sources.length) return;
+function showSearchSources(sources, query) {
   heroEl.hidden = true;
   const wrap = document.createElement("div");
   wrap.className = "msg bot";
   const b = document.createElement("div");
   b.className = "bubble";
-  b.innerHTML = '<div class="meta">🔎 Web search · ' + sources.map(escapeHtml).join(" · ") + "</div>";
+  const items = (sources || []).map((s) =>
+    s.url ? '<a href="' + escapeHtml(s.url) + '" target="_blank" rel="noopener">' + escapeHtml(s.dom || s.title) + "</a>" : escapeHtml(s.title)
+  );
+  b.innerHTML = '<div class="meta">🔎 Searched the web' +
+    (query ? " · <em>" + escapeHtml(query) + "</em>" : "") +
+    (items.length ? "<br>" + items.join(" · ") : "") + "</div>";
   wrap.appendChild(b);
   messagesEl.appendChild(wrap);
   chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// ---- "Conscious decision": should this message trigger a web search? ----
+function heuristicDecision(msg) {
+  const t = (msg || "").toLowerCase().trim();
+  if (t.length < 4) return false;
+  if (/^(hi|hey|hello|yo|sup|thanks|thank you|ty|ok|okay|k|lol|nice|cool|great|good|bye|gm|gn)\b/.test(t)) return false;
+  if (/\b(write|compose|draft|poem|story|joke|rap|haiku|song|essay|pretend|roleplay|role-play|imagine|translate|summar)/.test(t)) return false;
+  if (/^[\s\d+\-*/().,^%=]+\??$/.test(t)) return false; // pure arithmetic
+  // Strong "needs fresh/external info" signals.
+  if (/\b(latest|today|tonight|current(ly)?|right now|this (week|month|year)|as of|202[4-9]|20[3-9]\d|news|weather|forecast|price|stock|score|who won|standings|release date|released|launch|update|version|near me|open now|schedule)\b/.test(t)) return true;
+  return null; // ambiguous → let the model decide
+}
+// Ask the active engine for a one-shot judgement (the conscious decision).
+async function quickGenerate(messages, maxTokens) {
+  if (engineMode === "webllm") {
+    if (!webllmEngine) return "";
+    const r = await webllmEngine.chat.completions.create({ messages, max_tokens: maxTokens, temperature: 0, stream: false });
+    return r?.choices?.[0]?.message?.content || "";
+  }
+  return await workerClassify(messages, maxTokens);
+}
+async function decideSearch(msg) {
+  const h = heuristicDecision(msg);
+  if (h === true) return { search: true, query: msg };
+  if (h === false) return { search: false };
+  // Ambiguous: the model consciously decides, and refines the query if so.
+  const judged = await quickGenerate([
+    { role: "system", content:
+      "Decide if answering the user needs a live web search. Search only for current events, real-time data (weather, prices, scores), recent releases, or obscure/specific facts you may not know. Do NOT search for greetings, opinions, creative writing, coding, math, or general knowledge. Reply with ONLY one line: either \"NO\" or \"SEARCH: <a short web query>\"." },
+    { role: "user", content: msg },
+  ], 24).catch(() => "");
+  const m = /SEARCH:\s*(.+)/i.exec(judged || "");
+  if (m) return { search: true, query: m[1].trim().replace(/["']/g, "").slice(0, 200) || msg };
+  // Default to NOT searching when unsure — this prevents useless searches.
+  return { search: false };
 }
 
 // ---- WebLLM engine (WebGPU, on this thread) ----
@@ -1107,6 +1253,9 @@ function makeMockWebLLM() {
       window.__mockModelId = modelId;
       return {
         chat: { completions: { async create(req) {
+          if (req && req.stream === false) { // the search-decision call
+            return { choices: [{ message: { content: window.__mockDecision || "NO" } }] };
+          }
           window.__mockLastMessages = req?.messages;
           if ((window.__mockGenCrashes | 0) > 0) { window.__mockGenCrashes--; throw new Error("mock gen crash: device lost"); }
           const words = ["Hello", " from", " the", " WebGPU", " engine", "."];
@@ -1301,6 +1450,11 @@ function handleWorkerMessage(e) {
       attemptRecovery(msg.failures, msg.diag);
       break;
     }
+    case "classify-result": {
+      const r = classifyResolvers[msg.id];
+      if (r) { delete classifyResolvers[msg.id]; r(msg.text || ""); }
+      break;
+    }
     case "token": {
       streamToken(msg.text, msg.tps);
       break;
@@ -1485,7 +1639,9 @@ function markSegmented(container, value) {
   container.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === String(value)));
 }
 function refreshSearchNote() {
-  $("searchNote").hidden = !settings.webSearch;
+  const on = settings.searchMode && settings.searchMode !== "off";
+  $("searchNote").hidden = !on;
+  if (on) $("searchNote").textContent = "🔎 web: " + settings.searchMode;
 }
 async function refreshStorageInfo() {
   const el = $("storageInfo");
@@ -1498,7 +1654,8 @@ async function refreshStorageInfo() {
   } catch { el.textContent = ""; }
 }
 function syncSettingsUI() {
-  $("setWebSearch").checked = settings.webSearch;
+  markSegmented($("setSearchMode"), settings.searchMode);
+  $("setProxy").value = settings.proxy || "";
   $("setEnter").checked = settings.enterToSend;
   markSegmented($("setMaxTokens"), settings.maxTokens);
   markSegmented($("setPerf"), settings.perfMode);
@@ -1516,7 +1673,8 @@ $("settingsClose").addEventListener("click", closeSettings);
 $("settingsOverlay").addEventListener("click", (e) => { if (e.target === $("settingsOverlay")) closeSettings(); });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("settingsOverlay").hidden) closeSettings(); });
 
-$("setWebSearch").addEventListener("change", (e) => { settings.webSearch = e.target.checked; saveSettings(); refreshSearchNote(); });
+$("setSearchMode").addEventListener("click", (e) => { const v = e.target?.dataset?.v; if (v) { settings.searchMode = v; saveSettings(); markSegmented($("setSearchMode"), v); refreshSearchNote(); } });
+$("setProxy").addEventListener("input", (e) => { settings.proxy = e.target.value.trim(); saveSettings(); });
 $("setEnter").addEventListener("change", (e) => { settings.enterToSend = e.target.checked; saveSettings(); });
 $("setTemp").addEventListener("input", (e) => { settings.temperature = +e.target.value; $("setTempVal").textContent = tempLabel(e.target.value); saveSettings(); });
 $("setPersona").addEventListener("input", (e) => { settings.persona = e.target.value; saveSettings(); });

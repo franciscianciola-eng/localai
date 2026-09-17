@@ -340,6 +340,25 @@ async function generate(messages, params = {}) {
   });
 }
 
+// A short, greedy, non-streaming completion used for the "should I search?"
+// decision — returns the whole text in one message instead of streaming to UI.
+async function runClassify(messages, id, maxTokens) {
+  let text = "";
+  if (!generator) { self.postMessage({ type: "classify-result", id, text: "" }); return; }
+  try {
+    const out = await generator(messages, {
+      max_new_tokens: maxTokens ?? 24,
+      do_sample: false,
+      repetition_penalty: 1.1,
+    });
+    const seq = Array.isArray(out) ? out[0] : out;
+    const gen = seq?.generated_text;
+    if (Array.isArray(gen)) text = gen[gen.length - 1]?.content || "";
+    else if (typeof gen === "string") text = gen;
+  } catch {}
+  self.postMessage({ type: "classify-result", id, text });
+}
+
 self.addEventListener("message", async (e) => {
   const msg = e.data;
   try {
@@ -347,11 +366,14 @@ self.addEventListener("message", async (e) => {
       await load(msg.modelId, msg.opts);
     } else if (msg.type === "generate") {
       await generate(msg.messages, msg.params);
+    } else if (msg.type === "classify") {
+      await runClassify(msg.messages, msg.id, msg.maxTokens);
     } else if (msg.type === "stop") {
       stoppingCriteria.interrupt();
     }
   } catch (err) {
-    self.postMessage({ type: "error", message: errText(err) });
+    if (msg.type === "classify") self.postMessage({ type: "classify-result", id: msg.id, text: "" });
+    else self.postMessage({ type: "error", message: errText(err) });
   }
 });
 

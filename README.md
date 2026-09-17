@@ -157,13 +157,23 @@ and live tokens/second while the model is talking.
 
 Open the **⚙️ gear** in the header:
 
-- **Web search** *(off by default)* — an optional "internet sandbox". When on,
-  your message is sent to **Wikipedia's public API** (CORS-enabled, no key,
-  read-only) to fetch relevant facts, which are handed to the local model as
-  grounding, with the sources shown in the chat. This is the **only** feature
-  that sends anything off your device, which is why it's off unless you opt in.
-  (A keyless, backend-less page can only reach APIs that allow cross-origin
-  requests, so Wikipedia is the safe, reliable source here.)
+- **Web search** *(off by default)* — an optional internet feature with three
+  modes: **Off**, **Smart**, and **Always**.
+  - In **Smart** mode the model makes a **conscious decision** before every
+    reply about whether a search is actually worth it — a fast heuristic
+    catches the obvious cases (greetings, creative writing and math → no
+    search; "latest", "today", prices, weather → search), and genuinely
+    ambiguous questions are put to the model itself, which answers only
+    "NO" or "SEARCH: <query>". This avoids useless searches.
+  - When it does search, it queries the **full web via DuckDuckGo** (through a
+    CORS relay) **and Wikipedia** (directly), and hands the top results to the
+    local model as grounding, with clickable sources shown in the chat.
+  - **Why a relay?** A keyless, backend-less browser page can't read arbitrary
+    websites directly (browsers block cross-origin reads). Full-web fetches
+    therefore route through a public CORS proxy; you can paste your own proxy
+    URL in settings for reliability/privacy, and Wikipedia still works without
+    one. This is the **only** feature that sends anything off your device,
+    which is why it's off unless you opt in.
 - **Reply length** — Short / Medium / Long output cap.
 - **Creativity** — temperature, from Precise to Wild.
 - **Performance mode** — Auto (tunes for integrated graphics and backs off on
