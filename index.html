@@ -301,11 +301,13 @@
         </div>
         <div class="desc warn">Off by default. <b>Smart</b>: the model decides for itself whether a search is needed
           (no useless searches). <b>Always</b>: search every message. When it searches, your query is sent to
-          DuckDuckGo &amp; Wikipedia (full web via a relay) — the only time anything leaves your device.</div>
-        <input type="text" id="setProxy" placeholder="Optional: your own CORS proxy URL (use %s for the target)"
+          the web (Jina Reader for the full web + Wikipedia) — the only time anything leaves your device.</div>
+        <input type="password" id="setJinaKey" placeholder="Optional: free Jina AI key (jina.ai) for better full-web search"
+          autocomplete="off"
           style="width:100%;margin-top:8px;font:inherit;color:var(--text);background:var(--panel-2);border:1px solid var(--border);border-radius:8px;padding:8px 10px;">
-        <div class="desc">Full-web fetches route through a public CORS relay (a browser can't read arbitrary sites
-          directly). Public relays can be slow or down; paste your own here for reliability/privacy. Wikipedia works without one.</div>
+        <div class="desc">Full-web results come from <b>Jina Reader</b>, which reads pages for the browser (keyless, but
+          rate-limited). A free key from <b>jina.ai</b> makes web search faster and more reliable. Wikipedia always works
+          without any key.</div>
       </div>
 
       <div class="setting">
@@ -408,7 +410,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v12"; // bump on every push — shown in the footer
+const APP_VERSION = "v13"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
@@ -427,16 +429,17 @@ const MODELS = {
     label: "Qwen2.5 0.5B · smartest small model (~0.5 GB)",
   },
   "llama32-1b": {
-    gpu: true,
-    label: "Llama 3.2 · 1B · needs WebGPU (~0.9 GB)",
+    gpu: true, // prefers WebGPU, but also runs on CPU (has an onnx repo)
+    id: "onnx-community/Llama-3.2-1B-Instruct-ONNX",
+    label: "Llama 3.2 · 1B · WebGPU or slow CPU (~0.9 GB)",
   },
   "gemma2-2b": {
-    gpu: true,
-    label: "Gemma 2 · 2B · needs WebGPU (~1.6 GB)",
+    gpu: true, // WebGPU only (no CPU-runnable onnx build)
+    label: "Gemma 2 · 2B · best with WebGPU (~1.6 GB)",
   },
   "phi35-mini": {
-    gpu: true,
-    label: "Phi-3.5 mini · 3.8B (closest to 5B) · needs WebGPU (~2.3 GB)",
+    gpu: true, // WebGPU only
+    label: "Phi-3.5 mini · 3.8B (closest to 5B) · best with WebGPU (~2.3 GB)",
   },
 };
 // Heaviest → lightest, for automatic step-down when a model won't run.
@@ -477,7 +480,10 @@ const THROTTLE = [
 const WATCHDOG_MS = 25000; // no token for this long ⇒ the GPU context is wedged
 const BASE_SYSTEM_PROMPT =
   "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
-  "Answer clearly and concisely in plain language. If you are unsure, say so.";
+  "You have a web search tool: when a system message labeled 'WEB SEARCH RESULTS' is present, it " +
+  "means the web was just searched for you — treat those results as current and authoritative, base " +
+  "your answer on them, and briefly mention that you looked it up online. " +
+  "Answer clearly and concisely in plain language. If you are unsure and have no web results, say so.";
 function systemPrompt() {
   const persona = (settings.persona || "").trim();
   return persona ? BASE_SYSTEM_PROMPT + "\n\n" + persona : BASE_SYSTEM_PROMPT;
@@ -491,7 +497,9 @@ const SEARCH_ENDPOINT = params.get("searchapi") || "https://en.wikipedia.org/w/a
 
 const SETTINGS_DEFAULTS = {
   searchMode: "off",  // off | smart (model decides) | always — OFF by default
-  proxy: "",          // optional custom CORS proxy for full-web fetches
+  jinaKey: "",        // optional free Jina AI key for better full-web search
+  readerBase: "",     // optional custom Jina Reader base (advanced)
+  proxy: "",          // legacy: optional custom CORS proxy
   maxTokens: 512,
   temperature: 0.6,
   perfMode: "auto",   // auto | full | eco | lowpower
@@ -780,15 +788,44 @@ function removeErrorCard() {
   if (errorCard) { errorCard.remove(); errorCard = null; }
 }
 
+// The largest model at or below `key` in the size order that can run on the CPU
+// (has an onnx repo) — used to keep a WebGPU-only model working without WebGPU.
+function nearestCpuModel(key) {
+  const i = MODEL_ORDER.indexOf(key);
+  for (let j = Math.max(0, i); j < MODEL_ORDER.length; j++) {
+    const m = MODELS[MODEL_ORDER[j]];
+    if (m && m.id) return MODEL_ORDER[j];
+  }
+  return null;
+}
+
 async function loadModel() {
   const sel = customModelId ? null : MODELS[modelSelect.value];
-  const gpuOnly = !!(sel && sel.gpu);
-  // Route to the WebGPU (WebLLM) engine for GPU-only models, or when this
-  // device already switched to WebLLM. Test hooks (custom model / hub) always
-  // use the transformers.js path.
-  if (!customModelId && !hubOverride && (gpuOnly || engineMode === "webllm")) {
-    if (!(await hasWebGPU())) {
-      if (gpuOnly) {
+  // Routing (WebGPU vs CPU, and the no-WebGPU step-down) runs for any real
+  // dropdown model. A fully custom modelId bypasses it; a hub override only
+  // changes where weights come from, so routing still applies.
+  if (!customModelId && sel) {
+    const preferGpu = sel.gpu || engineMode === "webllm";
+    const gpu = await hasWebGPU();
+    // Prefer the WebGPU (WebLLM) engine for big models (or if this device
+    // switched to it) when WebGPU is actually available.
+    if (preferGpu && gpu && WEBLLM_MODELS[modelSelect.value]) {
+      engineMode = "webllm";
+      loadWebLLM();
+      return;
+    }
+    // No usable WebGPU → must run on the CPU (onnxruntime) engine. A model with
+    // no CPU-runnable build (gemma/phi) can't run here, so step down to the
+    // largest model that can — it still works, just slowly.
+    if (!sel.id) {
+      const alt = nearestCpuModel(modelSelect.value);
+      if (alt) {
+        const from = sel.label.split(" · ")[0];
+        const to = MODELS[alt].label.split(" · ")[0];
+        modelSelect.value = alt;
+        try { localStorage.setItem("localai-model", alt); } catch {}
+        setNote("No WebGPU here, so " + from + " can't run — using " + to + " on the CPU instead (slower).", true);
+      } else {
         showLoadError(
           [{ device: "webgpu", dtype: "q4f16", kind: "no-webgpu",
              message: "This model needs WebGPU, which isn't available in this browser." }],
@@ -796,19 +833,15 @@ async function loadModel() {
         );
         return;
       }
-      // A non-GPU model while pinned to WebLLM but WebGPU vanished: use the CPU engine.
-      engineMode = "transformers";
-      try { localStorage.removeItem("localai-engine"); } catch {}
-    } else {
-      engineMode = "webllm";
-      loadWebLLM();
-      return;
     }
+    // Fell back to CPU: leave WebLLM mode.
+    if (engineMode === "webllm") { engineMode = "transformers"; try { localStorage.removeItem("localai-engine"); } catch {} }
   }
   ready = false;
   removeErrorCard();
   const label = customModelId || MODELS[modelSelect.value].label.split(" · ")[0];
-  showLoader("Loading " + label + "…");
+  const big = !customModelId && MODELS[modelSelect.value] && MODELS[modelSelect.value].gpu;
+  showLoader("Loading " + label + (big ? " on the CPU (this is slow for a big model)…" : "…"));
   deviceChip.textContent = "starting…";
   const opts = { ...workerOpts };
   if (hubOverride) opts.remoteHost = hubOverride;
@@ -849,7 +882,9 @@ async function startGeneration() {
         if (found && found.context) {
           msgs.push({
             role: "system",
-            content: "Up-to-date information from a web search. Use it to answer accurately; if you rely on it, note that it came from the web:\n\n" + found.context,
+            content: "WEB SEARCH RESULTS for \"" + query + "\" (just fetched from the live web — use these to answer, " +
+              "and mention you searched the web):\n\n" + found.context +
+              "\n\nNow answer the user's message using the information above.",
           });
           showSearchSources(found.sources, query);
         }
@@ -1095,35 +1130,14 @@ async function attemptRecovery(failures, diag) {
 }
 
 // ---- Web search ----
-// Full-web search needs a CORS proxy (a browser can't read arbitrary sites
-// directly). We try the user's proxy first, then public fallbacks, and always
-// also query Wikipedia directly (no proxy needed) so results still appear if
-// every proxy is down. Off by default.
-const CORS_PROXIES = [
-  (u) => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
-  (u) => "https://corsproxy.io/?url=" + encodeURIComponent(u),
-  (u) => "https://thingproxy.freeboard.io/fetch/" + u,
-];
-function proxyBuilders() {
-  const custom = (settings.proxy || "").trim();
-  if (!custom) return CORS_PROXIES;
-  const b = custom.includes("%s")
-    ? (u) => custom.replace("%s", encodeURIComponent(u))
-    : (u) => custom + encodeURIComponent(u);
-  return [b, ...CORS_PROXIES];
-}
-async function proxiedFetch(url) {
-  let lastErr;
-  for (const build of proxyBuilders()) {
-    try {
-      const r = await fetch(build(url), { cache: "no-store" });
-      if (r.ok) { const t = await r.text(); if (t) return t; }
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error("all proxies failed");
-}
+// A browser can't read arbitrary sites directly (cross-origin), so full-web
+// search goes through Jina Reader (r.jina.ai / s.jina.ai) — keyless and
+// CORS-enabled — which fetches pages server-side. Providers are tried in order,
+// and Wikipedia (direct, no relay) is always queried too so results still
+// appear if every relay is down. Off by default.
+const READER_BASE = () => (params.get("readerbase") || settings.readerBase || "https://r.jina.ai/");
+const SEARCH_API_BASE = () => (params.get("jinasearch") || "https://s.jina.ai/");
 function domainOf(u) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return ""; } }
-// DuckDuckGo HTML links wrap the real URL in a redirect (…/l/?uddg=<enc>).
 function unwrapDdg(href) {
   try {
     if (!href) return "";
@@ -1133,18 +1147,57 @@ function unwrapDdg(href) {
     return uddg ? decodeURIComponent(uddg) : href;
   } catch { return href || ""; }
 }
-async function webSearchFull(query) {
-  const html = await proxiedFetch("https://html.duckduckgo.com/html/?q=" + encodeURIComponent(query));
-  const doc = new DOMParser().parseFromString(html, "text/html");
-  const out = [];
-  doc.querySelectorAll(".result, .web-result").forEach((el) => {
-    const a = el.querySelector("a.result__a");
-    const snip = el.querySelector(".result__snippet");
-    if (a && a.textContent.trim()) {
-      out.push({ title: a.textContent.trim(), url: unwrapDdg(a.getAttribute("href")), snippet: snip ? snip.textContent.trim() : "" });
-    }
+
+// Provider 1 (best, needs a free key): Jina's search API returns the top web
+// results already read and cleaned.
+async function jinaKeySearch(query) {
+  const key = (settings.jinaKey || "").trim();
+  if (!key) return [];
+  const r = await fetch(SEARCH_API_BASE() + encodeURIComponent(query), {
+    headers: { Authorization: "Bearer " + key, Accept: "application/json", "X-Respond-With": "no-content" },
+    cache: "no-store",
   });
-  return out.slice(0, 5);
+  if (!r.ok) return [];
+  const data = await r.json();
+  const items = data?.data || data?.results || [];
+  return items.slice(0, 5).map((it) => ({
+    title: it.title || it.url || "", url: it.url || "", snippet: (it.description || it.content || it.snippet || "").slice(0, 400),
+  }));
+}
+// Provider 2 (keyless): read a DuckDuckGo results page through Jina Reader and
+// pull the result links + snippets out of the returned markdown.
+async function jinaReaderSearch(query) {
+  const target = "https://lite.duckduckgo.com/lite/?q=" + encodeURIComponent(query);
+  const r = await fetch(READER_BASE() + target, {
+    headers: { Accept: "text/plain", "X-Return-Format": "markdown", ...(settings.jinaKey ? { Authorization: "Bearer " + settings.jinaKey.trim() } : {}) },
+    cache: "no-store",
+  });
+  if (!r.ok) return [];
+  return parseReaderMarkdown(await r.text());
+}
+function parseReaderMarkdown(md) {
+  const out = [];
+  const seen = new Set();
+  const re = /\[([^\]\n]{2,140})\]\((https?:\/\/[^\s)]+)\)/g;
+  let m;
+  while ((m = re.exec(md)) && out.length < 8) {
+    const title = m[1].trim();
+    const url = unwrapDdg(m[2]);
+    const dom = domainOf(url);
+    if (!dom || /duckduckgo\.com|jina\.ai|w3\.org|schema\.org|gstatic|googleapis/.test(dom)) continue;
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const after = md.slice(m.index + m[0].length, m.index + m[0].length + 240).replace(/[|>#*`\-]+/g, " ").replace(/\s+/g, " ").trim();
+    out.push({ title, url, snippet: after });
+  }
+  return out;
+}
+// Full-web search: first provider that returns results wins.
+async function fullWebSearch(query) {
+  for (const provider of [jinaKeySearch, jinaReaderSearch]) {
+    try { const r = await provider(query); if (r && r.length) return r; } catch {}
+  }
+  return [];
 }
 async function wikiSearch(query) {
   const url = SEARCH_ENDPOINT +
@@ -1165,7 +1218,7 @@ async function webSearch(query) {
   if (!q) return null;
   const low = effectiveThrottle() >= 2;
   const cap = low ? 900 : 2000;
-  const [web, wiki] = await Promise.allSettled([webSearchFull(q), wikiSearch(q)]);
+  const [web, wiki] = await Promise.allSettled([fullWebSearch(q), wikiSearch(q)]);
   const results = []
     .concat(web.status === "fulfilled" ? web.value : [])
     .concat(wiki.status === "fulfilled" ? wiki.value : []);
@@ -1655,7 +1708,7 @@ async function refreshStorageInfo() {
 }
 function syncSettingsUI() {
   markSegmented($("setSearchMode"), settings.searchMode);
-  $("setProxy").value = settings.proxy || "";
+  $("setJinaKey").value = settings.jinaKey || "";
   $("setEnter").checked = settings.enterToSend;
   markSegmented($("setMaxTokens"), settings.maxTokens);
   markSegmented($("setPerf"), settings.perfMode);
@@ -1674,7 +1727,7 @@ $("settingsOverlay").addEventListener("click", (e) => { if (e.target === $("sett
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("settingsOverlay").hidden) closeSettings(); });
 
 $("setSearchMode").addEventListener("click", (e) => { const v = e.target?.dataset?.v; if (v) { settings.searchMode = v; saveSettings(); markSegmented($("setSearchMode"), v); refreshSearchNote(); } });
-$("setProxy").addEventListener("input", (e) => { settings.proxy = e.target.value.trim(); saveSettings(); });
+$("setJinaKey").addEventListener("input", (e) => { settings.jinaKey = e.target.value.trim(); saveSettings(); });
 $("setEnter").addEventListener("change", (e) => { settings.enterToSend = e.target.checked; saveSettings(); });
 $("setTemp").addEventListener("input", (e) => { settings.temperature = +e.target.value; $("setTempVal").textContent = tempLabel(e.target.value); saveSettings(); });
 $("setPersona").addEventListener("input", (e) => { settings.persona = e.target.value; saveSettings(); });

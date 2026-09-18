@@ -38,16 +38,10 @@ const server = http.createServer(async (req, res) => {
       query: { pages: { "1": { index: 1, title: "Photosynthesis", extract: "CANARYTOKEN123 Plants make food from light." } } },
     }));
   }
-  // A stand-in CORS proxy returning canned DuckDuckGo HTML for the full-web path.
-  if (p === "/proxy") {
-    const target = new URLSearchParams(req.url.split("?")[1] || "").get("url") || "";
-    res.writeHead(200, { "content-type": "text/html", "access-control-allow-origin": "*" });
-    if (/duckduckgo/.test(target)) {
-      return res.end('<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=' +
-        encodeURIComponent("https://example.com/news") + '">Big News Today</a>' +
-        '<div class="result__snippet">WEBCANARY42 the latest headline from the web.</div></div>');
-    }
-    return res.end("<html></html>");
+  // A stand-in Jina Reader returning canned markdown for the full-web path.
+  if (p.startsWith("/reader/")) {
+    res.writeHead(200, { "content-type": "text/plain", "access-control-allow-origin": "*" });
+    return res.end("Search results\n\n[Big News Today](https://example.com/news) WEBCANARY42 the latest headline from the web.\n\n[Other](https://example.org/x) another snippet.");
   }
   // A stand-in CDN mirror serving the vendored runtime files (used to test the
   // fallback when the host itself refuses to serve the big wasm).
@@ -259,23 +253,23 @@ const check = (name, cond, extra = "") => {
   await ctx.close();
 }
 
-// ---------- Test 7: a GPU-only model without WebGPU shows a clear message ----------
+// ---------- Test 7: a GPU-only model without WebGPU steps down to a CPU model ----------
 {
   const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
   await ctx.addInitScript(() => { try { localStorage.setItem("localai-model", "gemma2-2b"); } catch {} });
   const page = await ctx.newPage();
-  // nogpu forces the "no WebGPU" path deterministically (headless may expose a
-  // flaky SwiftShader adapter otherwise).
-  await page.goto(`http://localhost:${PORT}/?nogpu=1`, { waitUntil: "load" });
-  const cardShown = await page
-    .waitForSelector(".card.error", { timeout: 30000 })
+  // nogpu forces "no WebGPU": Gemma (WebGPU-only) can't run, so the app should
+  // step down to the largest CPU-capable model (Llama 1B) and load it. hub
+  // serves the tiny fixture for any model id so it loads offline.
+  await page.goto(`http://localhost:${PORT}/?nogpu=1&cpu=1&hub=http://localhost:${PORT}/hub/`, { waitUntil: "load" });
+  const settled = await page
+    .waitForFunction(() =>
+      document.getElementById("modelSelect").value === "llama32-1b" &&
+      document.getElementById("loader").hidden &&
+      !document.querySelector(".card.error"), { timeout: 60000 })
     .then(() => true)
     .catch(() => false);
-  check("GPU-only model without WebGPU shows the error card", cardShown);
-  if (cardShown) {
-    const text = await page.textContent(".card.error");
-    check("message explains WebGPU is needed", /needs WebGPU/i.test(text), text.slice(0, 160));
-  }
+  check("no-WebGPU big model steps down to a CPU-capable model", settled);
   await ctx.close();
 }
 
@@ -363,7 +357,7 @@ const check = (name, cond, extra = "") => {
   });
   const page = await ctx.newPage();
   await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1` +
-    `&searchapi=http://localhost:${PORT}/wikiapi&proxy=http://localhost:${PORT}/proxy?url=%s`, { waitUntil: "load" });
+    `&searchapi=http://localhost:${PORT}/wikiapi&readerbase=http://localhost:${PORT}/reader/`, { waitUntil: "load" });
   await page.fill("#input", "how do plants eat");
   await page.press("#input", "Enter");
   const replied = await page
@@ -373,8 +367,10 @@ const check = (name, cond, extra = "") => {
   check("reply completes with web search on", replied);
   if (replied) {
     const msgs = await page.evaluate(() => JSON.stringify(window.__mockLastMessages || []));
-    check("full-web (DuckDuckGo) context injected", msgs.includes("WEBCANARY42"), msgs.slice(0, 160));
+    check("full-web (Jina Reader) context injected", msgs.includes("WEBCANARY42"), msgs.slice(0, 160));
     check("Wikipedia context also injected", msgs.includes("CANARYTOKEN123"));
+    check("results are labeled WEB SEARCH RESULTS for the model", msgs.includes("WEB SEARCH RESULTS"));
+    check("system prompt tells the model it has a web search tool", /web search tool/i.test(msgs));
     const src = await page.textContent("#messages");
     check("search sources shown in the chat", /Searched the web/s.test(src));
   }
@@ -389,7 +385,7 @@ const check = (name, cond, extra = "") => {
   });
   const page = await ctx.newPage();
   await page.goto(`http://localhost:${PORT}/?forcewebllm=1&webllmmock=1` +
-    `&searchapi=http://localhost:${PORT}/wikiapi&proxy=http://localhost:${PORT}/proxy?url=%s`, { waitUntil: "load" });
+    `&searchapi=http://localhost:${PORT}/wikiapi&readerbase=http://localhost:${PORT}/reader/`, { waitUntil: "load" });
 
   // A greeting: the heuristic says no search — nothing should be fetched.
   await page.fill("#input", "hey there");

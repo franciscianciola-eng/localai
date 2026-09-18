@@ -71,23 +71,23 @@ downloaded directly from Hugging Face and quantized to 4/8-bit ONNX for speed:
 | [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | ~0.3 GB | Best speed/coherence balance |
 | [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct) | ~0.5 GB | Smartest small model |
 
-**Large models** (need **WebGPU**; run on the WebLLM engine only — much smarter,
-much larger downloads, and a capable GPU helps):
+**Large models** (best with **WebGPU**; smarter, larger downloads):
 
 | Model | Params | Download | Notes |
 |---|---|---|---|
-| [Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) | 1B | ~0.9 GB | Solid all-rounder |
-| [Gemma-2-2B-it](https://huggingface.co/google/gemma-2-2b-it) | 2B | ~1.6 GB | Strong 2B model |
-| [Phi-3.5-mini-instruct](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | 3.8B | ~2.3 GB | Closest browser-runnable model to 5B* |
+| [Llama-3.2-1B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct) | 1B | ~0.9 GB | Runs on WebGPU **or** the CPU (slowly) |
+| [Gemma-2-2B-it](https://huggingface.co/google/gemma-2-2b-it) | 2B | ~1.6 GB | WebGPU |
+| [Phi-3.5-mini-instruct](https://huggingface.co/microsoft/Phi-3.5-mini-instruct) | 3.8B | ~2.3 GB | WebGPU · closest browser-runnable model to 5B* |
 
 \* There's no widely-available ~5B open model in a browser-ready format;
-Phi-3.5-mini (3.8B) is the nearest that runs reliably in-browser. Bigger
-options (Qwen2.5-7B, Llama-3.1-8B) exist and can be added, but need a lot of
-GPU memory.
+Phi-3.5-mini (3.8B) is the nearest that runs reliably in-browser.
 
-Switch models from the dropdown in the header; each is cached after its first
-download. The large models load through WebGPU — if your browser has no WebGPU,
-the app tells you and points you back to the small models.
+**Every model works on a Chromebook**, even without WebGPU: modern Chromebooks
+have WebGPU and run all of these; on a Chromebook without it, the small models
+and Llama-3.2-1B run on the CPU (slowly), and Gemma/Phi (which have no
+CPU-runnable build) **automatically step down to the largest CPU-capable model**
+instead of failing. Switch models from the dropdown; each is cached after its
+first download.
 
 ## Two engines for maximum compatibility
 
@@ -165,15 +165,17 @@ Open the **⚙️ gear** in the header:
     search; "latest", "today", prices, weather → search), and genuinely
     ambiguous questions are put to the model itself, which answers only
     "NO" or "SEARCH: <query>". This avoids useless searches.
-  - When it does search, it queries the **full web via DuckDuckGo** (through a
-    CORS relay) **and Wikipedia** (directly), and hands the top results to the
-    local model as grounding, with clickable sources shown in the chat.
-  - **Why a relay?** A keyless, backend-less browser page can't read arbitrary
-    websites directly (browsers block cross-origin reads). Full-web fetches
-    therefore route through a public CORS proxy; you can paste your own proxy
-    URL in settings for reliability/privacy, and Wikipedia still works without
-    one. This is the **only** feature that sends anything off your device,
-    which is why it's off unless you opt in.
+  - When it does search, it queries the **full web via [Jina Reader](https://jina.ai/reader/)**
+    **and Wikipedia** (directly), and hands the top results to the local model
+    as grounding — with the system prompt telling the model it *has* live web
+    results and must use and cite them — and clickable sources shown in the chat.
+  - **Why Jina Reader?** A keyless, backend-less browser page can't read
+    arbitrary websites directly (browsers block cross-origin reads). Jina Reader
+    fetches pages for the browser and is CORS-enabled and keyless (rate-limited).
+    A free key from **jina.ai** (pasted in settings) makes web search faster and
+    more reliable; Wikipedia always works with no key. This is the **only**
+    feature that sends anything off your device, which is why it's off unless you
+    opt in.
 - **Reply length** — Short / Medium / Long output cap.
 - **Creativity** — temperature, from Precise to Wild.
 - **Performance mode** — Auto (tunes for integrated graphics and backs off on
