@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#4f6ef7"/>
+  <text x="50%" y="52%" dy=".08em" text-anchor="middle" dominant-baseline="middle"
+        font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+        font-size="230" font-weight="700" fill="#ffffff">AI</text>
+</svg>

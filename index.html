@@ -4,7 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LocalAI — private AI chat in your browser</title>
-<meta name="description" content="A tiny, efficient AI chatbot that runs 100% locally in your browser using public open weights. No server, no API key, no data leaves your device.">
+<meta name="description" content="A tiny, efficient AI chatbot that runs 100% locally in your browser using public open weights. No server, no API key, no data leaves your device. Works offline after the first load.">
+<link rel="manifest" href="./manifest.webmanifest">
+<meta name="theme-color" content="#4f6ef7">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
 <script>
 // Cross-origin isolation bootstrap: registers a service worker that adds
 // COOP/COEP headers so WASM inference can use all CPU cores. One reload on the
@@ -277,6 +280,7 @@
   <span class="chip" id="deviceChip">starting…</span>
   <span class="chip" id="speedChip" hidden></span>
   <span class="chip search-note" id="searchNote" hidden>🔎 web search on</span>
+  <span class="chip" id="offlineChip" hidden title="You're offline — downloaded models still work">✈️ offline</span>
   <div class="spacer"></div>
   <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙️</button>
   <button id="clearBtn" title="Clear the conversation">Clear</button>
@@ -410,7 +414,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v13"; // bump on every push — shown in the footer
+const APP_VERSION = "v14"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;
@@ -450,7 +454,12 @@ const DEFAULT_MODEL = "smollm2-135m";
 // instead of onnxruntime. It's WebGPU-only, but it sidesteps the onnxruntime
 // runtime entirely — so it's the automatic fallback when that engine crashes
 // on a device (e.g. an onnxruntime kernel that aborts on a specific browser).
-const WEBLLM_CDN = "https://esm.run/@mlc-ai/web-llm";
+const WEBLLM_LOCAL = "./vendor/web-llm.js"; // vendored so WebGPU works offline
+const WEBLLM_CDN = "https://esm.run/@mlc-ai/web-llm"; // fallback only
+async function importWebLLM() {
+  try { return await import(/* @vite-ignore */ WEBLLM_LOCAL); }
+  catch { return await import(/* @vite-ignore */ WEBLLM_CDN); }
+}
 const WEBLLM_MODELS = {
   "smollm2-135m": "SmolLM2-135M-Instruct-q0f16-MLC",
   "smollm2-360m": "SmolLM2-360M-Instruct-q4f16_1-MLC",
@@ -864,8 +873,8 @@ async function startGeneration() {
 
   // Optional web-search grounding. In "smart" mode the model makes a conscious
   // decision about whether a search is actually needed (no useless searches);
-  // in "always" mode it searches every turn.
-  if (settings.searchMode !== "off") {
+  // in "always" mode it searches every turn. Skipped entirely when offline.
+  if (settings.searchMode !== "off" && navigator.onLine !== false) {
     const lastUser = [...history].reverse().find((m) => m.role === "user");
     if (lastUser) {
       let doSearch = true;
@@ -928,6 +937,11 @@ function diagnose(failures, diag) {
   const lines = [];
   const kinds = new Set(failures.map((f) => f.kind));
   const hf = diag.huggingface;
+  if (navigator.onLine === false) {
+    lines.push("You're offline, and this model hasn't been downloaded yet — so there's nothing to load from the cache. " +
+      "Reconnect once to download it (it's then cached and works offline forever). Any model you've already used still works offline right now.");
+    return lines;
+  }
   if (hf && !hf.ok) {
     if (hf.error) {
       lines.push("This network appears to block huggingface.co, which hosts the model weights. " +
@@ -1337,7 +1351,7 @@ async function loadWebLLM() {
     : "Tuned for integrated graphics; an external/discrete GPU is used automatically when present";
   updateUiState();
   try {
-    const webllm = params.get("webllmmock") ? makeMockWebLLM() : await import(/* @vite-ignore */ WEBLLM_CDN);
+    const webllm = params.get("webllmmock") ? makeMockWebLLM() : await importWebLLM();
     const modelId = webllmModelId(key, level);
     window.__engine = "webllm";
     window.__throttle = throttleLevel;
@@ -1747,6 +1761,15 @@ $("clearCacheBtn").addEventListener("click", async (e) => {
   refreshStorageInfo();
 });
 refreshSearchNote();
+
+function updateOnline() {
+  const off = navigator.onLine === false;
+  $("offlineChip").hidden = !off;
+  if (off && settings.searchMode !== "off") setNote("You're offline — web search is paused; downloaded models still work.", true);
+}
+window.addEventListener("online", updateOnline);
+window.addEventListener("offline", updateOnline);
+updateOnline();
 
 console.log("LocalAI " + APP_VERSION);
 setNote(null);

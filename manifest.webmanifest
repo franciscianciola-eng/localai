@@ -1,0 +1,13 @@
+{
+  "name": "LocalAI — private in-browser AI",
+  "short_name": "LocalAI",
+  "description": "A private AI chatbot that runs entirely in your browser. Works offline after the first load.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0e1116",
+  "theme_color": "#4f6ef7",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

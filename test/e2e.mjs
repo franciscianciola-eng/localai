@@ -17,6 +17,7 @@ const PORT = 8934;
 const types = {
   ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
   ".json": "application/json", ".wasm": "application/wasm", ".onnx": "application/octet-stream",
+  ".svg": "image/svg+xml", ".webmanifest": "application/manifest+json",
 };
 
 const server = http.createServer(async (req, res) => {
@@ -455,6 +456,46 @@ const check = (name, cond, extra = "") => {
     check("cache-clear retry was attempted", /"cacheCleared":\s*true/.test(text));
   }
   await page.close();
+}
+
+// ---------- Test 13: works offline — app shell + cached model load with no network ----------
+{
+  const ctx = await browser.newContext({ viewport: { width: 900, height: 700 } });
+  const page = await ctx.newPage();
+  const url = `http://localhost:${PORT}/?cpu=1&nogpu=1&modelId=tiny-llm&hub=http://localhost:${PORT}/hub/`;
+  // First visit ONLINE: caches the app shell, the vendored runtime, and the model.
+  await page.goto(url, { waitUntil: "load" });
+  await page.waitForFunction(() => navigator.serviceWorker && navigator.serviceWorker.controller, { timeout: 20000 }).catch(() => {});
+  await page.waitForFunction(() =>
+    document.getElementById("loader").hidden && /CPU|WebGPU/.test(document.getElementById("deviceChip").textContent),
+    { timeout: 90000 }).catch(() => {});
+  await page.fill("#input", "cache everything please");
+  await page.press("#input", "Enter");
+  const onlineReplied = await page.waitForSelector(".msg.bot .bubble .meta", { timeout: 90000 }).then(() => true).catch(() => false);
+  check("online: model generated (and everything is now cached)", onlineReplied);
+
+  // GO OFFLINE and reload — nothing may touch the network now.
+  await ctx.setOffline(true);
+  await page.reload({ waitUntil: "load" }).catch(() => {});
+  const shellLoaded = await page.waitForSelector("#modelSelect", { timeout: 20000 }).then(() => true).catch(() => false);
+  check("offline: the app shell loads from cache", shellLoaded);
+  check("offline indicator is shown", await page.isVisible("#offlineChip"));
+  // The cached model should still load and generate with no network.
+  const ready = await page.waitForFunction(() =>
+    document.getElementById("loader").hidden && !document.querySelector(".card.error") &&
+    /CPU|WebGPU/.test(document.getElementById("deviceChip").textContent),
+    { timeout: 90000 }).then(() => true).catch(() => false);
+  check("offline: cached model loads with no network", ready);
+  if (ready) {
+    const before = await page.locator(".msg.bot .bubble .meta").count();
+    await page.fill("#input", "answer me while offline");
+    await page.click("#sendBtn");
+    const offlineReplied = await page.waitForFunction(
+      (n) => document.querySelectorAll(".msg.bot .bubble .meta").length > n, before, { timeout: 90000 }
+    ).then(() => true).catch(() => false);
+    check("offline: model generates a fresh reply with no network", offlineReplied);
+  }
+  await ctx.close();
 }
 
 await browser.close();

@@ -222,6 +222,24 @@ npm install
 npm test          # runs test/e2e.mjs against a local Chromium
 ```
 
+## Works offline
+
+After the first visit, the whole app works with **no internet connection**:
+
+- A service worker **precaches the app shell** and caches the vendored AI
+  runtimes on first use, so the page loads offline.
+- **WebLLM is vendored** (not loaded from a CDN), so the WebGPU engine works
+  offline too.
+- Model weights are cached in the browser after their first download, so any
+  model you've already used **runs fully offline** — pick it, chat, done.
+- It's a **PWA**: "Install" / "Add to Home Screen" it and launch it like a
+  native app with no connection.
+
+What still needs a connection: downloading a model you haven't used yet, and
+web search (which is off by default). The app shows an **✈️ offline** chip,
+pauses web search while offline, and tells you clearly if you pick a model that
+hasn't been downloaded yet.
+
 ## Privacy
 
 After the one-time model download from Hugging Face's public CDN, all
