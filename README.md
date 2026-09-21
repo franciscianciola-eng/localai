@@ -246,6 +246,40 @@ three requested models — **Qwen2.5 0.5B, Llama 3.2 1B, Gemma 2 2B** — runnin
   (regenerates `localai-standalone.html` from `standalone.template.html` +
   the vendored WebLLM bundle).
 
+## A folder with the models on disk (`offline-package/`)
+
+The single file above still downloads each model **into the browser** the first
+time. If you'd rather have the model files sitting **in a folder** — to copy to
+an air-gapped machine, share on a USB stick, or just keep off the network — use
+[`offline-package/`](offline-package/). It's the same WebGPU app pointed at a
+local `models/` folder instead of the internet.
+
+```bash
+cd offline-package
+python3 download-models.py      # once, with internet (~3 GB, or --only qwen for ~0.5 GB)
+python3 serve.py                # any time; opens http://localhost:8000 — no internet used
+```
+
+(or just `./start.sh` on Linux/macOS/Chromebook, or double-click `start.bat` on
+Windows — it does both steps.)
+
+Two honest caveats, both handled by the package:
+
+- **The ~3 GB of weights aren't shipped in the repo** — a git repo is the wrong
+  place for gigabytes of binaries, and they can't be embedded in a small file.
+  So `download-models.py` fetches them once into `models/` (mirroring the exact
+  Hugging Face layout the app requests). Re-running it resumes — it skips what
+  you already have.
+- **It needs a local server, not `file://`** — browsers refuse to let a
+  `file://` page read other local files, so `serve.py` serves the folder at
+  `http://localhost` with the right MIME types. Everything still stays on your
+  machine.
+
+Rebuild the app after editing its template with `npm run build:offline`
+(regenerates `offline-package/index.html` from `offline.template.html` + the
+vendored WebLLM bundle). See [`offline-package/README.md`](offline-package/README.md)
+for the full walkthrough and troubleshooting.
+
 ## Works offline
 
 After the first visit, the whole app works with **no internet connection**:

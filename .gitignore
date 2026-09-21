@@ -1,2 +1,10 @@
 node_modules/
 package-lock.json
+
+# Downloaded model weights for the offline package (multi-GB; fetched on demand)
+offline-package/models/*
+!offline-package/models/README.md
+
+# Python bytecode cache
+__pycache__/
+*.pyc

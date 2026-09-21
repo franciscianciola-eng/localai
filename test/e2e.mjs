@@ -514,6 +514,25 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
+// ---------- Test 15: the offline-package build is valid and runs ----------
+// Served over http (not file://), with no models present. Catches inline-bundle
+// identifier collisions (e.g. a top-level `lib`) and confirms the local-appConfig
+// app boots and gates cleanly.
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const logs = [];
+  page.on("pageerror", (e) => logs.push("PAGEERR " + e.message));
+  await page.goto(`http://localhost:${PORT}/offline-package/index.html`, { waitUntil: "load" });
+  await page.waitForTimeout(2500);
+  const models = await page.evaluate(() => [...document.getElementById("modelSelect").options].map((o) => o.value));
+  check("offline package offers exactly the 3 requested models", JSON.stringify(models) === JSON.stringify(["qwen25-05b", "llama32-1b", "gemma2-2b"]), JSON.stringify(models));
+  check("offline package inline module runs without page errors", logs.length === 0, logs.join(" | "));
+  // No WebGPU in headless → clear WebGPU-needed message (checked before the models fetch).
+  const err = await page.evaluate(() => document.querySelector(".card.error")?.textContent || "");
+  check("offline package gates on WebGPU with a clear message", /needs WebGPU/i.test(err), err.slice(0, 120));
+  await page.close();
+}
+
 await browser.close();
 server.close();
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL TESTS PASSED");
