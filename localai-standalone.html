@@ -15318,7 +15318,54 @@ try {
 } catch {}
 
 console.log("LocalAI " + APP_VERSION);
-loadModel();
+
+/* ============================================================================
+ * Open in a separate app window, not just a tab in the browser.
+ * A double-clicked file always opens as a tab, so — unless we're already the
+ * dedicated window — we show a one-click launcher that pops the app out into
+ * its own sized browser window (its own taskbar entry, not a tab).
+ * ========================================================================== */
+const IS_APP_WINDOW = window.name === "localai-app" ||
+  (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+
+function openAppWindow(){
+  const aw = screen.availWidth || 1200, ah = screen.availHeight || 820;
+  const w = Math.min(1120, Math.max(880, aw - 200));
+  const h = Math.min(880, Math.max(620, ah - 120));
+  const left = Math.round((aw - w) / 2), top = Math.round((ah - h) / 2);
+  // Named + sized features make browsers open a real window rather than a tab.
+  return window.open(location.href, "localai-app",
+    "popup=yes,width=" + w + ",height=" + h + ",left=" + left + ",top=" + top);
+}
+
+function launchInSeparateWindow(){
+  let win = null; try { win = openAppWindow(); } catch {}   // auto-try (often needs the click below)
+  document.title = "LocalAI — launcher";
+  document.body.innerHTML =
+    '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">' +
+      '<div class="card" style="max-width:440px;text-align:center">' +
+        '<div class="logo" style="font-size:22px;margin-bottom:4px">Local<span>AI</span></div>' +
+        '<p style="color:var(--muted);margin:8px 0 20px">A private AI that runs on your device — in its own window.</p>' +
+        '<button class="primary" id="openWin" style="font-size:15px;padding:11px 22px">⇱ Open LocalAI</button>' +
+        '<div id="launchNote" style="color:var(--muted);font-size:12.5px;margin-top:16px;min-height:1.4em"></div>' +
+        '<div style="margin-top:12px"><a href="#" id="useTab" style="color:var(--muted);font-size:12px">or just use it in this tab</a></div>' +
+      '</div>' +
+    '</div>';
+  const note = document.getElementById("launchNote"), btn = document.getElementById("openWin");
+  const opened = () => { note.textContent = "✓ Opened in its own window — you can close this tab."; btn.textContent = "Reopen window"; };
+  if (win) opened(); else note.textContent = "Click to open it in a separate window.";
+  btn.addEventListener("click", () => {
+    const w2 = openAppWindow();
+    if (w2){ opened(); try { w2.focus(); } catch {} }
+    else note.textContent = "Your browser blocked the pop-out — allow pop-ups for this page, or use it in this tab below.";
+  });
+  document.getElementById("useTab").addEventListener("click", (e) => {
+    e.preventDefault(); try { window.name = "localai-app"; } catch {} location.reload();
+  });
+}
+
+if (IS_APP_WINDOW) loadModel();
+else launchInSeparateWindow();
 </script>
 </body>
 </html>

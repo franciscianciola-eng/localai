@@ -503,6 +503,9 @@ const check = (name, cond, extra = "") => {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   const logs = [];
   page.on("pageerror", (e) => logs.push("PAGEERR " + e.message));
+  // Run as the dedicated app window (window.name marker) so it loads the app,
+  // not the pop-out launcher.
+  await page.addInitScript(() => { window.name = "localai-app"; });
   await page.goto(`http://localhost:${PORT}/localai-standalone.html`, { waitUntil: "load" });
   await page.waitForTimeout(2500);
   const models = await page.evaluate(() => [...document.getElementById("modelSelect").options].map((o) => o.value));
@@ -511,6 +514,31 @@ const check = (name, cond, extra = "") => {
   // Headless has no real WebGPU, so it should show the clear WebGPU-needed message.
   const err = await page.evaluate(() => document.querySelector(".card.error")?.textContent || "");
   check("standalone gates on WebGPU with a clear message", /needs WebGPU/i.test(err), err.slice(0, 120));
+  await page.close();
+}
+
+// ---------- Test 14b: the standalone pops out into its own window ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const popups = [];
+  page.on("popup", (p) => popups.push(p));
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html`, { waitUntil: "load" });
+  await page.waitForTimeout(800);
+  // A normal tab shows the launcher (not the app itself).
+  const hasLauncher = await page.$("#openWin");
+  const appGone = await page.evaluate(() => !document.getElementById("modelSelect"));
+  check("standalone shows a separate-window launcher in a normal tab", !!hasLauncher && appGone);
+  // Clicking it opens a real separate window that runs the app.
+  await page.click("#openWin").catch(() => {});
+  await page.waitForTimeout(1500);
+  check("standalone launcher opens a separate window", popups.length >= 1, "popups=" + popups.length);
+  if (popups.length) {
+    const popup = popups[0];
+    await popup.waitForTimeout(2000);
+    const popModels = await popup.evaluate(() => [...(document.getElementById("modelSelect")?.options || [])].map((o) => o.value));
+    check("the separate window runs the app (3 models)", JSON.stringify(popModels) === JSON.stringify(["qwen25-05b", "llama32-1b", "gemma2-2b"]), JSON.stringify(popModels));
+    await popup.close();
+  }
   await page.close();
 }
 
