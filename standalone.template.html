@@ -56,6 +56,19 @@
   textarea:focus{border-color:var(--accent)}
   .foot-note{max-width:760px;margin:6px auto 0;font-size:11px;color:var(--muted);text-align:center}
   .foot-note.warn{color:var(--warn)}
+  /* Thinking (hidden reasoning + clean answer) */
+  .think{margin:0 0 8px}
+  .think-head{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:999px;padding:3px 10px;cursor:pointer}
+  .think-head:hover{filter:brightness(1.05)}
+  .think-head.thinking{color:var(--accent);border-color:var(--accent)55}
+  .think-head .chev{transition:transform .15s}
+  .think-head.open .chev{transform:rotate(90deg)}
+  .think-body{margin-top:6px;padding:8px 0 2px 12px;border-left:2px solid var(--border);color:var(--muted);font-size:13px;white-space:pre-wrap;overflow-wrap:break-word}
+  .tdots{display:inline-flex;gap:3px;align-items:center}
+  .tdots i{width:4px;height:4px;border-radius:50%;background:currentColor;display:inline-block;animation:tp 1s infinite}
+  .tdots i:nth-child(2){animation-delay:.15s} .tdots i:nth-child(3){animation-delay:.3s}
+  @keyframes tp{0%,60%,100%{opacity:.25}30%{opacity:1}}
+  #thinkBtn.on{border-color:var(--accent);color:var(--accent)}
   [hidden]{display:none!important}
 </style>
 </head>
@@ -68,6 +81,7 @@
   <span class="chip" id="speedChip" hidden></span>
   <span class="chip" id="offlineChip" hidden title="You're offline — downloaded models still work">✈️ offline</span>
   <div class="spacer"></div>
+  <button id="thinkBtn" title="Think before answering (reasoning stays hidden)">🧠 Think</button>
   <button id="clearBtn" title="Clear the conversation">Clear</button>
 </header>
 
@@ -122,6 +136,9 @@ const MODEL_ORDER = ["gemma2-2b", "llama32-1b", "qwen25-05b"]; // heaviest → l
 const DEFAULT_MODEL = "qwen25-05b";
 const SYSTEM_PROMPT = "You are a friendly, helpful AI assistant running entirely on the user's own device. " +
   "Answer clearly and concisely in plain language. If you are unsure, say so.";
+// When "Think" is on, the model reasons privately inside <think>…</think>; the UI
+// hides that and shows only the final answer (with a collapsible Thoughts toggle).
+const THINK_INSTRUCTION = " For any question that needs working out, first reason privately between <think> and </think> tags — keep it brief, just the key steps — then, after </think>, give a clear, concise final answer. Do not repeat the reasoning in the final answer. For very simple questions, answer directly without the tags.";
 // Escalating throttle: a browser can't read GPU power, so reduce the workload
 // (output length, sustained utilisation via pacing, and — where available —
 // a smaller-context build of the model) to keep an integrated GPU stable.
@@ -134,13 +151,16 @@ const WATCHDOG_MS = 30000;
 
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat"), messagesEl = $("messages"), heroEl = $("hero");
-const inputEl = $("input"), sendBtn = $("sendBtn"), stopBtn = $("stopBtn"), clearBtn = $("clearBtn");
+const inputEl = $("input"), sendBtn = $("sendBtn"), stopBtn = $("stopBtn"), clearBtn = $("clearBtn"), thinkBtn = $("thinkBtn");
 const modelSelect = $("modelSelect"), deviceChip = $("deviceChip"), speedChip = $("speedChip"), loaderEl = $("loader"), footNote = $("footNote");
 
 let history = [], engine = null, ready = false, generating = false, awaitingModel = false;
 let currentBubble = null, currentText = "", stopFlag = false, crashCount = 0;
 let throttleLevel = 0;
 try { throttleLevel = Math.min(2, Math.max(0, parseInt(localStorage.getItem("localai-std-throttle") || "0", 10) || 0)); } catch {}
+let thinkingMode = true;
+try { const v = localStorage.getItem("localai-std-think"); if (v !== null) thinkingMode = v === "1"; } catch {}
+function syncThinkBtn(){ thinkBtn.classList.toggle("on", thinkingMode); thinkBtn.textContent = thinkingMode ? "🧠 Think" : "🧠 Think: off"; thinkBtn.title = thinkingMode ? "Thinking on — the model reasons before answering (reasoning stays hidden). Click to turn off." : "Thinking off — the model answers directly. Click to turn on."; }
 
 for (const [k, m] of Object.entries(MODELS)) {
   const o = document.createElement("option"); o.value = k; o.textContent = m.label; modelSelect.appendChild(o);
@@ -159,6 +179,41 @@ function render(t){
   }
   return h;
 }
+// Split a raw model reply into hidden reasoning + clean answer. Tolerates
+// casing/spacing, an unclosed <think> (still reasoning), and no tags at all.
+function splitThink(raw){
+  const om = raw.match(/<\s*think\s*>/i);
+  if (!om) return { thoughts:"", answer: raw, thinking:false, hadTags:false };
+  const afterOpen = raw.slice(om.index + om[0].length);
+  const cm = afterOpen.match(/<\s*\/\s*think\s*>/i);
+  if (!cm) return { thoughts: afterOpen, answer:"", thinking:true, hadTags:true };
+  return { thoughts: afterOpen.slice(0, cm.index), answer: afterOpen.slice(cm.index + cm[0].length), thinking:false, hadTags:true };
+}
+const CURSOR = '<span class="cursor"></span>';
+// Build the bubble HTML: a "Thinking…"/"Thoughts" disclosure plus the answer.
+function replyHTML(raw, streaming){
+  const s = splitThink(raw);
+  const cur = streaming ? CURSOR : "";
+  if (!thinkingMode || !s.hadTags) return render(s.hadTags ? (s.answer || s.thoughts) : raw) + cur;
+  const hasAnswer = !!s.answer.trim();
+  // Still reasoning, answer not started → show the live "Thinking…" pill only.
+  if (streaming && s.thinking && !hasAnswer){
+    return '<div class="think"><div class="think-head thinking" data-toggle><span class="tdots"><i></i><i></i><i></i></span>Thinking…</div>' +
+           '<div class="think-body" hidden>'+render(s.thoughts)+'</div></div>' +
+           '<div class="answer">'+cur+'</div>';
+  }
+  // Answer started, or generation finished. If the model never closed <think>,
+  // reveal its reasoning as the answer so nothing is lost.
+  const answer = hasAnswer ? s.answer.trim() : s.thoughts.trim();
+  let h = "";
+  if (hasAnswer){
+    h += '<div class="think"><button class="think-head" data-toggle><span class="chev">▸</span>🧠 Thoughts</button>' +
+         '<div class="think-body" hidden>'+render(s.thoughts.trim())+'</div></div>';
+  }
+  return h + '<div class="answer">'+render(answer)+cur+'</div>';
+}
+// Test hook (guarded): lets the e2e suite exercise the real think-parsing.
+try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; } }; } catch {}
 function addBubble(role, text){
   heroEl.hidden = true;
   const w = document.createElement("div"); w.className = "msg " + (role==="user"?"user":"bot");
@@ -241,9 +296,10 @@ async function loadModel(){
 function startGeneration(){
   const t = THROTTLE[effectiveThrottle()];
   const recent = history.slice(-t.historyTurns);
-  const msgs = [{ role:"system", content: SYSTEM_PROMPT }, ...recent];
+  const sys = SYSTEM_PROMPT + (thinkingMode ? THINK_INSTRUCTION : "");
+  const msgs = [{ role:"system", content: sys }, ...recent];
   generating = true; awaitingModel = false; setNote(null); currentText = "";
-  currentBubble = addBubble("bot",""); currentBubble.innerHTML = '<span class="cursor"></span>';
+  currentBubble = addBubble("bot",""); currentBubble.innerHTML = CURSOR;
   speedChip.hidden = false; speedChip.textContent = "thinking…"; updateUi();
   runGeneration(msgs, t);
 }
@@ -251,7 +307,9 @@ async function runGeneration(msgs, t){
   stopFlag = false;
   let tokens = 0, firstAt = 0, lastAt = performance.now(), watchdog = null;
   try {
-    const stream = await engine.chat.completions.create({ messages: msgs, stream: true, temperature: 0.6, top_p: 0.9, max_tokens: t.maxTokens });
+    // Thinking needs room for reasoning *and* the answer, so lift the cap a bit.
+    const maxTok = thinkingMode ? Math.min(1024, t.maxTokens + 320) : t.maxTokens;
+    const stream = await engine.chat.completions.create({ messages: msgs, stream: true, temperature: 0.6, top_p: 0.9, max_tokens: maxTok });
     const stall = new Promise((_, rej) => { watchdog = setInterval(() => {
       if (performance.now() - lastAt > WATCHDOG_MS){ clearInterval(watchdog); stopFlag = true; try{engine?.interruptGenerate?.()}catch{}; rej(new Error("GPU stalled — no output for "+(WATCHDOG_MS/1000)+"s")); }
     }, 2000); });
@@ -261,8 +319,10 @@ async function runGeneration(msgs, t){
         const d = chunk.choices?.[0]?.delta?.content || "";
         if (d){ lastAt = performance.now(); if(!firstAt) firstAt = performance.now(); tokens++;
           currentText += d;
-          if (currentBubble){ currentBubble.innerHTML = render(currentText)+'<span class="cursor"></span>'; chatEl.scrollTop = chatEl.scrollHeight; }
-          const el = firstAt ? (performance.now()-firstAt)/1000 : 0; if (el>0.2) speedChip.textContent = (tokens/el).toFixed(1)+" tok/s";
+          if (currentBubble){ currentBubble.innerHTML = replyHTML(currentText, true); chatEl.scrollTop = chatEl.scrollHeight; }
+          const el = firstAt ? (performance.now()-firstAt)/1000 : 0;
+          const rate = el>0.2 ? (tokens/el).toFixed(1)+" tok/s" : "thinking…";
+          speedChip.textContent = splitThink(currentText).thinking ? "🧠 thinking…" : rate;
           if (t.paceMs) await new Promise(r=>setTimeout(r,t.paceMs));
         }
       }
@@ -274,9 +334,15 @@ async function runGeneration(msgs, t){
   }
 }
 function finishReply(){
-  const finalText = (currentText||"").trim() || "(no response — try again)";
-  if (currentBubble){ currentBubble.innerHTML = render(finalText); }
-  history.push({ role:"assistant", content: finalText }); saveConvo();
+  const raw = (currentText||"").trim();
+  const s = splitThink(raw);
+  // Store only the clean answer in history (not the reasoning), so the model
+  // isn't fed its own scratch work next turn and context stays small.
+  const stored = (thinkingMode && s.hadTags)
+    ? (s.answer.trim() || s.thoughts.trim() || "(no answer — try again)")
+    : (raw || "(no response — try again)");
+  if (currentBubble){ currentBubble.innerHTML = replyHTML(raw || "(no response — try again)", false); }
+  history.push({ role:"assistant", content: stored }); saveConvo();
   generating = false; currentBubble = null; speedChip.hidden = true; updateUi(); chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -292,6 +358,18 @@ function send(text){
 sendBtn.addEventListener("click", () => send());
 stopBtn.addEventListener("click", () => { stopFlag = true; try { engine?.interruptGenerate?.(); } catch {} });
 clearBtn.addEventListener("click", () => { history = []; awaitingModel = false; saveConvo(); messagesEl.querySelectorAll(".msg").forEach(n=>n.remove()); heroEl.hidden = false; setNote(null); });
+thinkBtn.addEventListener("click", () => {
+  thinkingMode = !thinkingMode;
+  try { localStorage.setItem("localai-std-think", thinkingMode ? "1" : "0"); } catch {}
+  syncThinkBtn();
+  setNote(thinkingMode ? "Thinking on — the model reasons first, then answers (reasoning stays hidden)." : "Thinking off — the model answers directly.");
+});
+// Expand/collapse a reply's hidden reasoning.
+messagesEl.addEventListener("click", (e) => {
+  const head = e.target.closest("[data-toggle]"); if (!head) return;
+  const body = head.parentElement.querySelector(".think-body"); if (!body) return;
+  body.hidden = !body.hidden; head.classList.toggle("open", !body.hidden);
+});
 modelSelect.addEventListener("change", async () => {
   try { localStorage.setItem("localai-std-model", modelSelect.value); } catch {}
   throttleLevel = 0; crashCount = 0; try { localStorage.removeItem("localai-std-throttle"); } catch {}
@@ -311,6 +389,7 @@ try {
   if (Array.isArray(saved) && saved.length){ history = saved; for (const m of history) addBubble(m.role, m.content); }
 } catch {}
 
+syncThinkBtn();
 console.log("LocalAI " + APP_VERSION);
 
 /* ============================================================================

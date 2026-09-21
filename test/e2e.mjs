@@ -542,6 +542,41 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
+// ---------- Test 14c: standalone "Think" mode hides reasoning, shows clean answer ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(String(e)));
+  await page.addInitScript(() => { window.name = "localai-app"; });
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html?thinktest=1`, { waitUntil: "load" });
+  await page.waitForTimeout(1500);
+  const r = await page.evaluate(() => {
+    const T = window.__thinkTest; if (!T) return { err: "no hook" };
+    T.setThinking(true);
+    const raw = "<think>ball=x, bat=x+1, so 2x+1=1.10 → x=0.05</think>The ball costs 5 cents.";
+    const out = {
+      answer: T.splitThink(raw).answer.trim(),
+      finished: T.replyHTML(raw, false),
+      thinking: T.replyHTML("<think>working it out", true),
+      unclosed: T.replyHTML("<think>no close tag here", false),
+    };
+    T.setThinking(false);
+    out.off = T.replyHTML(raw, false);
+    return out;
+  });
+  check("think: reasoning is parsed out of the answer", r.answer === "The ball costs 5 cents.", r.answer);
+  check("think: finished reply shows a Thoughts toggle + clean answer, reasoning hidden",
+    /🧠 Thoughts/.test(r.finished) && /The ball costs 5 cents\./.test(r.finished) && /think-body" hidden/.test(r.finished));
+  check("think: while thinking it shows only a Thinking… pill (no answer leaked)",
+    /Thinking…/.test(r.thinking) && !/costs/.test(r.thinking));
+  check("think: an unclosed <think> is revealed as the answer (nothing lost)",
+    /no close tag here/.test(r.unclosed) && !/Thoughts/.test(r.unclosed));
+  check("think: with Think off, the answer renders plainly (no toggle)",
+    /5 cents/.test(r.off) && !/Thoughts/.test(r.off));
+  check("think: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
+  await page.close();
+}
+
 // ---------- Test 15: the offline-package build is valid and runs ----------
 // Served over http (not file://), with no models present. Catches inline-bundle
 // identifier collisions (e.g. a top-level `lib`) and confirms the local-appConfig
