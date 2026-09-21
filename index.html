@@ -395,6 +395,10 @@
         <button data-q="Write a short, funny poem about a Chromebook.">Chromebook poem</button>
         <button data-q="Give me three ideas for a healthy 10-minute dinner.">Quick dinner ideas</button>
       </div>
+      <p style="margin-top:16px;font-size:12px">
+        Want one local file you can open on a Chromebook (WebGPU)?
+        <a href="./localai-standalone.html" download style="color:var(--accent)">Download the offline single-file version ↓</a>
+      </p>
     </div>
     <div class="card" id="loader" hidden>
       <div class="row"><strong id="loadTitle">Loading model…</strong><span id="loadPct">0%</span></div>
@@ -414,7 +418,7 @@
 </footer>
 
 <script type="module">
-const APP_VERSION = "v14"; // bump on every push — shown in the footer
+const APP_VERSION = "v15"; // bump on every push — shown in the footer
 // Small models (≤0.5B) run on either engine — CPU/WASM or WebGPU. The larger
 // ones (gpu: true) are far too big for WASM, so they run only on the WebGPU
 // (WebLLM) engine. "id" is the onnx-community repo for the transformers.js path;

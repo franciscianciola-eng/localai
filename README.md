@@ -222,6 +222,30 @@ npm install
 npm test          # runs test/e2e.mjs against a local Chromium
 ```
 
+## One local file for a Chromebook (`localai-standalone.html`)
+
+There's also a **single self-contained HTML file** you can keep on a Chromebook
+and open locally (even via `file://`, no server):
+
+**Download it here:** https://franciscianciola-eng.github.io/localai/localai-standalone.html
+— open that link, then **Save Page As → "Webpage, HTML Only"** to get the one
+file, or use the "Download the offline single-file version" link on the main app.
+
+It bundles the WebLLM engine inline (so nothing loads from a CDN) and offers the
+three requested models — **Qwen2.5 0.5B, Llama 3.2 1B, Gemma 2 2B** — running on
+**WebGPU**. Notes:
+
+- **First run needs internet once per model** — ~3 GB of weights can't be
+  embedded in an HTML file, so each model downloads from the web the first time
+  and is then cached in the browser and runs **fully offline** afterward.
+- **Needs WebGPU** (Chrome 113+, which nearly all Chromebooks from ~2023 have).
+  Unlike the hosted app, this single file can't use the CPU engine, because
+  `file://` blocks the Web Workers that path needs — so if a device has no
+  WebGPU it shows a clear message and you'd use the hosted app instead.
+- Rebuild it after editing the template with `npm run build:standalone`
+  (regenerates `localai-standalone.html` from `standalone.template.html` +
+  the vendored WebLLM bundle).
+
 ## Works offline
 
 After the first visit, the whole app works with **no internet connection**:

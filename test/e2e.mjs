@@ -498,6 +498,22 @@ const check = (name, cond, extra = "") => {
   await ctx.close();
 }
 
+// ---------- Test 14: the standalone single-file build is valid and runs ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const logs = [];
+  page.on("pageerror", (e) => logs.push("PAGEERR " + e.message));
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html`, { waitUntil: "load" });
+  await page.waitForTimeout(2500);
+  const models = await page.evaluate(() => [...document.getElementById("modelSelect").options].map((o) => o.value));
+  check("standalone offers exactly the 3 requested models", JSON.stringify(models) === JSON.stringify(["qwen25-05b", "llama32-1b", "gemma2-2b"]), JSON.stringify(models));
+  check("standalone inline module runs without page errors", logs.length === 0, logs.join(" | "));
+  // Headless has no real WebGPU, so it should show the clear WebGPU-needed message.
+  const err = await page.evaluate(() => document.querySelector(".card.error")?.textContent || "");
+  check("standalone gates on WebGPU with a clear message", /needs WebGPU/i.test(err), err.slice(0, 120));
+  await page.close();
+}
+
 await browser.close();
 server.close();
 console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL TESTS PASSED");

@@ -4,6 +4,7 @@
   "version": "1.0.0",
   "description": "Private AI chat that runs 100% in the browser",
   "scripts": {
+    "build:standalone": "node build-standalone.mjs",
     "test": "node test/e2e.mjs"
   },
   "devDependencies": {
