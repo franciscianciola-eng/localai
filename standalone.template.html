@@ -56,6 +56,23 @@
   textarea:focus{border-color:var(--accent)}
   .foot-note{max-width:760px;margin:6px auto 0;font-size:11px;color:var(--muted);text-align:center}
   .foot-note.warn{color:var(--warn)}
+  /* Attachments */
+  .iconbtn{padding:8px 10px;font-size:16px;line-height:1}
+  .attach-row{max-width:760px;margin:0 auto 8px;display:flex;flex-wrap:wrap;gap:8px}
+  .att-chip{display:inline-flex;align-items:center;gap:8px;background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:5px 6px 5px 8px;max-width:230px}
+  .att-chip img{width:34px;height:34px;object-fit:cover;border-radius:6px;flex:none}
+  .att-chip .ic{font-size:20px;width:30px;text-align:center}
+  .att-meta{display:flex;flex-direction:column;min-width:0}
+  .att-meta b{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+  .att-meta i{font-size:11px;color:var(--muted);font-style:normal;display:flex;align-items:center;gap:5px}
+  .att-x{border:none;background:none;color:var(--muted);cursor:pointer;font-size:13px;padding:2px 4px;border-radius:6px}
+  .att-x:hover{color:#e5534b;background:var(--bg)}
+  .spin{width:10px;height:10px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .att-strip{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+  .att-strip img{max-width:190px;max-height:190px;border-radius:8px;border:1px solid var(--border)}
+  .att-strip .att-file{font-size:12px;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:3px 8px}
+  body.dragging::after{content:"Drop image or file to attach";position:fixed;inset:12px;border:2px dashed var(--accent);border-radius:16px;background:color-mix(in srgb,var(--accent) 8%,transparent);display:flex;align-items:center;justify-content:center;font-weight:600;color:var(--accent);z-index:50;pointer-events:none}
   /* Thinking (hidden reasoning + clean answer) */
   .think{margin:0 0 8px}
   .think-head{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:12px;color:var(--muted);background:var(--panel-2);border:1px solid var(--border);border-radius:999px;padding:3px 10px;cursor:pointer}
@@ -106,8 +123,12 @@
 </div>
 
 <footer>
+  <div class="attach-row" id="attachRow" hidden></div>
   <div class="composer">
-    <textarea id="input" rows="1" placeholder="Message the local AI…" autofocus autocomplete="off"></textarea>
+    <button class="iconbtn" id="attachBtn" title="Attach an image or a text/code file">📎</button>
+    <input type="file" id="fileInput" multiple hidden
+      accept="image/*,text/*,.txt,.md,.markdown,.csv,.tsv,.json,.js,.mjs,.ts,.jsx,.tsx,.py,.rb,.go,.rs,.java,.c,.h,.cpp,.cs,.php,.swift,.kt,.sh,.yaml,.yml,.toml,.ini,.xml,.html,.css,.scss,.sql,.log,.tex,.srt,.vtt">
+    <textarea id="input" rows="1" placeholder="Message the local AI…  (📎 attach an image or file)" autofocus autocomplete="off"></textarea>
     <button class="primary" id="sendBtn" disabled>Send</button>
     <button class="danger" id="stopBtn" hidden>Stop</button>
   </div>
@@ -152,6 +173,7 @@ const WATCHDOG_MS = 30000;
 const $ = (id) => document.getElementById(id);
 const chatEl = $("chat"), messagesEl = $("messages"), heroEl = $("hero");
 const inputEl = $("input"), sendBtn = $("sendBtn"), stopBtn = $("stopBtn"), clearBtn = $("clearBtn"), thinkBtn = $("thinkBtn");
+const attachBtn = $("attachBtn"), fileInput = $("fileInput"), attachRow = $("attachRow");
 const modelSelect = $("modelSelect"), deviceChip = $("deviceChip"), speedChip = $("speedChip"), loaderEl = $("loader"), footNote = $("footNote");
 
 let history = [], engine = null, ready = false, generating = false, awaitingModel = false;
@@ -160,6 +182,7 @@ let throttleLevel = 0;
 try { throttleLevel = Math.min(2, Math.max(0, parseInt(localStorage.getItem("localai-std-throttle") || "0", 10) || 0)); } catch {}
 let thinkingMode = true;
 try { const v = localStorage.getItem("localai-std-think"); if (v !== null) thinkingMode = v === "1"; } catch {}
+let attachments = [], attId = 0;   // pending attachments for the next message
 function syncThinkBtn(){ thinkBtn.classList.toggle("on", thinkingMode); thinkBtn.textContent = thinkingMode ? "🧠 Think" : "🧠 Think: off"; thinkBtn.title = thinkingMode ? "Thinking on — the model reasons before answering (reasoning stays hidden). Click to turn off." : "Thinking off — the model answers directly. Click to turn on."; }
 
 for (const [k, m] of Object.entries(MODELS)) {
@@ -196,11 +219,12 @@ function replyHTML(raw, streaming){
   const cur = streaming ? CURSOR : "";
   if (!thinkingMode || !s.hadTags) return render(s.hadTags ? (s.answer || s.thoughts) : raw) + cur;
   const hasAnswer = !!s.answer.trim();
-  // Still reasoning, answer not started → show the live "Thinking…" pill only.
+  // Still reasoning, answer not started → stream the reasoning live in the open
+  // panel; it collapses into a "Thoughts" toggle once the answer begins.
   if (streaming && s.thinking && !hasAnswer){
-    return '<div class="think"><div class="think-head thinking" data-toggle><span class="tdots"><i></i><i></i><i></i></span>Thinking…</div>' +
-           '<div class="think-body" hidden>'+render(s.thoughts)+'</div></div>' +
-           '<div class="answer">'+cur+'</div>';
+    return '<div class="think"><div class="think-head thinking"><span class="tdots"><i></i><i></i><i></i></span>Thinking…</div>' +
+           '<div class="think-body">'+render(s.thoughts)+CURSOR+'</div></div>' +
+           '<div class="answer"></div>';
   }
   // Answer started, or generation finished. If the model never closed <think>,
   // reveal its reasoning as the answer so nothing is lost.
@@ -213,7 +237,7 @@ function replyHTML(raw, streaming){
   return h + '<div class="answer">'+render(answer)+cur+'</div>';
 }
 // Test hook (guarded): lets the e2e suite exercise the real think-parsing.
-try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; } }; } catch {}
+try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })) }; } catch {}
 function addBubble(role, text){
   heroEl.hidden = true;
   const w = document.createElement("div"); w.className = "msg " + (role==="user"?"user":"bot");
@@ -221,9 +245,19 @@ function addBubble(role, text){
   w.appendChild(b); messagesEl.appendChild(w); chatEl.scrollTop = chatEl.scrollHeight; return b;
 }
 function setNote(t, warn){ footNote.textContent = (t || "One local HTML file · WebGPU · each model downloads once, then runs offline") ; footNote.className = "foot-note" + (warn?" warn":""); }
-function updateUi(){ sendBtn.disabled = generating || !inputEl.value.trim(); sendBtn.hidden = generating; stopBtn.hidden = !generating; modelSelect.disabled = generating; clearBtn.disabled = generating; }
+function updateUi(){
+  const hasInput = !!inputEl.value.trim() || attachments.length > 0;
+  sendBtn.disabled = generating || !hasInput || attProcessing();
+  sendBtn.hidden = generating; stopBtn.hidden = !generating;
+  modelSelect.disabled = generating; clearBtn.disabled = generating; attachBtn.disabled = generating;
+}
 function showLoader(title){ loaderEl.hidden = false; $("loadTitle").textContent = title; $("barfill").style.width="0%"; $("loadPct").textContent="0%"; $("loadDetail").textContent="Preparing… (cached models load instantly)"; messagesEl.appendChild(loaderEl); chatEl.scrollTop = chatEl.scrollHeight; }
-function saveConvo(){ try { sessionStorage.setItem("localai-std-convo", JSON.stringify(history)); } catch {} }
+function saveConvo(){
+  try { sessionStorage.setItem("localai-std-convo", JSON.stringify(history)); }
+  catch { // over quota (usually big image thumbnails) — save again without them
+    try { sessionStorage.setItem("localai-std-convo", JSON.stringify(history.map((m) => m.atts ? { ...m, atts: m.atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime })) } : m))); } catch {}
+  }
+}
 
 async function hasWebGPU(){ try { return !!(navigator.gpu && await navigator.gpu.requestAdapter()); } catch { return false; } }
 
@@ -295,7 +329,7 @@ async function loadModel(){
 
 function startGeneration(){
   const t = THROTTLE[effectiveThrottle()];
-  const recent = history.slice(-t.historyTurns);
+  const recent = history.slice(-t.historyTurns).map((m) => ({ role: m.role, content: m.content }));
   const sys = SYSTEM_PROMPT + (thinkingMode ? THINK_INSTRUCTION : "");
   const msgs = [{ role:"system", content: sys }, ...recent];
   generating = true; awaitingModel = false; setNote(null); currentText = "";
@@ -346,18 +380,138 @@ function finishReply(){
   generating = false; currentBubble = null; speedChip.hidden = true; updateUi(); chatEl.scrollTop = chatEl.scrollHeight;
 }
 
+/* ============================================================================
+ * Attachments: images (shown inline + OCR'd for any text) and text/code files
+ * (read and given to the model). These are text-only models — they can't "see"
+ * pictures, so for images we extract text via OCR and tell the model that's all
+ * it has. OCR uses Tesseract, fetched on first use (needs internet once, like
+ * the model itself); the rest works fully offline.
+ * ========================================================================== */
+const OCR_MAIN = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+const OCR_PATHS = {
+  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
+  langPath: "https://tessdata.projectnaptha.com/4.0.0",
+};
+const TEXT_EXT = new Set(["txt","md","markdown","csv","tsv","json","js","mjs","ts","jsx","tsx","py","rb","go","rs","java","c","h","cpp","cc","hpp","cs","php","swift","kt","sh","bash","zsh","yaml","yml","toml","ini","cfg","conf","xml","html","htm","css","scss","less","sql","log","tex","srt","vtt","env","gitignore","dockerfile"]);
+const FILE_TEXT_LIMIT = 8000;
+let _ocr = null, _ocrLoading = null;
+
+function extOf(name){ const i = name.lastIndexOf("."); return i >= 0 ? name.slice(i+1).toLowerCase() : ""; }
+function isTextFile(file){ return (file.type && file.type.startsWith("text/")) || TEXT_EXT.has(extOf(file.name||"")) || /json|xml|javascript|csv/.test(file.type||""); }
+function fileToDataURL(file){ return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); }); }
+function downscale(dataUrl, maxDim){ return new Promise((res) => { const img = new Image(); img.onload = () => { let w = img.width, h = img.height; const scale = Math.min(1, maxDim/Math.max(w,h)); const cw = Math.max(1,Math.round(w*scale)), ch = Math.max(1,Math.round(h*scale)); const c = document.createElement("canvas"); c.width = cw; c.height = ch; c.getContext("2d").drawImage(img,0,0,cw,ch); try { res(c.toDataURL("image/png")); } catch { res(dataUrl); } }; img.onerror = () => res(dataUrl); img.src = dataUrl; }); }
+function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("couldn't load "+src)); document.head.appendChild(s); }); }
+async function ensureOCR(){
+  if (_ocr) return _ocr;
+  if (!_ocrLoading) _ocrLoading = (async () => {
+    if (typeof Tesseract === "undefined") await loadScript(OCR_MAIN);
+    _ocr = await Tesseract.createWorker("eng", 1, OCR_PATHS);
+    return _ocr;
+  })().catch((e) => { _ocrLoading = null; throw e; });
+  return _ocrLoading;
+}
+async function runOCR(att, imgDataUrl){
+  att.status = "ocr"; renderAttachRow(); updateUi();
+  try {
+    const worker = await ensureOCR();
+    const { data } = await worker.recognize(imgDataUrl);
+    att.text = (data && data.text ? data.text.trim() : "");
+    att.note = att.text ? "" : "no text found";
+  } catch (e) {
+    att.text = ""; att.note = (navigator.onLine === false) ? "offline — image text unread" : "couldn't read image text";
+  }
+  att.status = "ready"; renderAttachRow(); updateUi();
+}
+async function handleFiles(list){
+  for (const file of Array.from(list || [])){
+    const id = "att" + (attId++);
+    if (file.type && file.type.startsWith("image/")){
+      const att = { id, kind:"image", name:file.name || "image.png", mime:file.type, status:"reading", text:"", note:"" };
+      attachments.push(att); renderAttachRow(); updateUi();
+      try {
+        const full = await fileToDataURL(file);
+        att.thumb = await downscale(full, 320);
+        renderAttachRow();
+        runOCR(att, await downscale(full, 1600));   // async; enables send when done
+      } catch { att.status = "ready"; att.note = "couldn't read image"; renderAttachRow(); updateUi(); }
+    } else if (isTextFile(file)){
+      const att = { id, kind:"file", name:file.name || "file.txt", mime:file.type || "text/plain", status:"reading", text:"", note:"" };
+      attachments.push(att); renderAttachRow(); updateUi();
+      try {
+        let txt = await file.text();
+        if (txt.length > FILE_TEXT_LIMIT) txt = txt.slice(0, FILE_TEXT_LIMIT) + "\n…[truncated; " + txt.length + " chars total]";
+        att.text = txt; att.note = "";
+      } catch { att.note = "couldn't read file"; }
+      att.status = "ready"; renderAttachRow(); updateUi();
+    } else {
+      attachments.push({ id, kind:"file", name:file.name || "file", mime:file.type || "?", status:"ready", text:"", note:"unsupported — text & images only" });
+      renderAttachRow(); updateUi();
+    }
+  }
+}
+function renderAttachRow(){
+  if (!attachments.length){ attachRow.hidden = true; attachRow.innerHTML = ""; return; }
+  attachRow.hidden = false;
+  attachRow.innerHTML = attachments.map((a) => {
+    const busy = a.status === "reading" || a.status === "ocr";
+    const label = a.status === "ocr" ? "reading text…" : a.status === "reading" ? "reading…" : (a.note || "ready");
+    const visual = (a.kind === "image" && a.thumb) ? '<img src="'+a.thumb+'">' : '<span class="ic">📄</span>';
+    return '<span class="att-chip">' + visual +
+      '<span class="att-meta"><b>'+esc(a.name)+'</b><i>'+(busy?'<span class="spin"></span>':'')+esc(label)+'</i></span>' +
+      '<button class="att-x" data-remove="'+a.id+'" title="Remove">✕</button></span>';
+  }).join("");
+}
+function attProcessing(){ return attachments.some((a) => a.status === "reading" || a.status === "ocr"); }
+function buildModelContent(typed, atts){
+  let pre = "";
+  for (const a of atts){
+    if (a.kind === "image"){
+      const t = (a.text || "").trim();
+      pre += t
+        ? '\n[Image "'+a.name+'" — you cannot see it, but this text was read from it via OCR]\n'+t+'\n'
+        : '\n[Image "'+a.name+'" attached — no readable text was found, and you cannot see images directly.]\n';
+    } else if (a.text){
+      pre += '\n[File "'+a.name+'" ('+a.mime+')]\n'+a.text+'\n';
+    }
+  }
+  if (pre) pre = "The user shared the following. Use it to answer their message.\n" + pre + "\n";
+  return (pre + (typed || "")).trim();
+}
+function addUserMessage(displayText, atts){
+  heroEl.hidden = true;
+  const w = document.createElement("div"); w.className = "msg user";
+  const b = document.createElement("div"); b.className = "bubble";
+  let h = "";
+  if (atts && atts.length){
+    h += '<div class="att-strip">' + atts.map((a) =>
+      (a.kind === "image" && a.thumb) ? '<img src="'+a.thumb+'" alt="'+esc(a.name)+'">' : '<span class="att-file">📄 '+esc(a.name)+'</span>'
+    ).join("") + '</div>';
+  }
+  if (displayText) h += '<div>'+render(displayText)+'</div>';
+  b.innerHTML = h; w.appendChild(b); messagesEl.appendChild(w); chatEl.scrollTop = chatEl.scrollHeight; return b;
+}
+
 function send(text){
-  const content = (text ?? inputEl.value).trim();
-  if (!content || generating) return;
+  if (generating) return;
+  const typed = (text ?? inputEl.value).trim();
+  const atts = attachments.slice();
+  if (!typed && !atts.length) return;
+  if (attProcessing()){ setNote("Still reading the attachment — one moment…", true); return; }
+  const modelContent = buildModelContent(typed, atts);
+  const displayAtts = atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime, thumb:a.thumb }));
   inputEl.value = ""; inputEl.style.height = "auto";
-  addBubble("user", content); history.push({ role:"user", content }); crashCount = 0; saveConvo();
+  attachments = []; renderAttachRow();
+  addUserMessage(typed, displayAtts);
+  history.push({ role:"user", content: modelContent, display: typed, atts: displayAtts });
+  crashCount = 0; saveConvo();
   if (ready) startGeneration();
   else { awaitingModel = true; setNote("Model is still loading — your message will send automatically when it's ready.", true); updateUi(); }
 }
 
 sendBtn.addEventListener("click", () => send());
 stopBtn.addEventListener("click", () => { stopFlag = true; try { engine?.interruptGenerate?.(); } catch {} });
-clearBtn.addEventListener("click", () => { history = []; awaitingModel = false; saveConvo(); messagesEl.querySelectorAll(".msg").forEach(n=>n.remove()); heroEl.hidden = false; setNote(null); });
+clearBtn.addEventListener("click", () => { history = []; awaitingModel = false; attachments = []; renderAttachRow(); saveConvo(); messagesEl.querySelectorAll(".msg").forEach(n=>n.remove()); heroEl.hidden = false; setNote(null); updateUi(); });
 thinkBtn.addEventListener("click", () => {
   thinkingMode = !thinkingMode;
   try { localStorage.setItem("localai-std-think", thinkingMode ? "1" : "0"); } catch {}
@@ -380,13 +534,31 @@ inputEl.addEventListener("input", () => { inputEl.style.height="auto"; inputEl.s
 inputEl.addEventListener("keydown", (e) => { if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); } });
 heroEl.addEventListener("click", (e) => { const q = e.target?.dataset?.q; if (q) send(q); });
 
+// Attachments: click to pick, drag-and-drop anywhere, paste an image.
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => { handleFiles(fileInput.files); fileInput.value = ""; });
+attachRow.addEventListener("click", (e) => { const id = e.target?.dataset?.remove; if (id){ attachments = attachments.filter((a) => a.id !== id); renderAttachRow(); updateUi(); } });
+let dragDepth = 0;
+const hasFiles = (e) => e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+window.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+window.addEventListener("dragenter", (e) => { if (hasFiles(e)){ dragDepth++; document.body.classList.add("dragging"); } });
+window.addEventListener("dragleave", () => { if (--dragDepth <= 0){ dragDepth = 0; document.body.classList.remove("dragging"); } });
+window.addEventListener("drop", (e) => { if (e.dataTransfer?.files?.length){ e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging"); handleFiles(e.dataTransfer.files); } });
+inputEl.addEventListener("paste", (e) => { const imgs = Array.from(e.clipboardData?.items || []).filter((i) => i.type.startsWith("image/")).map((i) => i.getAsFile()).filter(Boolean); if (imgs.length){ e.preventDefault(); handleFiles(imgs); } });
+
 function updateOnline(){ $("offlineChip").hidden = navigator.onLine !== false; }
 window.addEventListener("online", updateOnline); window.addEventListener("offline", updateOnline); updateOnline();
 
 try { const d = sessionStorage.getItem("localai-std-draft"); if (d && !inputEl.value){ inputEl.value = d; updateUi(); } } catch {}
 try {
   const saved = JSON.parse(sessionStorage.getItem("localai-std-convo") || "null");
-  if (Array.isArray(saved) && saved.length){ history = saved; for (const m of history) addBubble(m.role, m.content); }
+  if (Array.isArray(saved) && saved.length){
+    history = saved;
+    for (const m of history){
+      if (m.role === "user" && m.atts && m.atts.length) addUserMessage(m.display || "", m.atts);
+      else addBubble(m.role, m.role === "user" ? (m.display ?? m.content) : m.content);
+    }
+  }
 } catch {}
 
 syncThinkBtn();

@@ -7,6 +7,8 @@
 import { chromium } from "playwright-core";
 import http from "http";
 import { readFile } from "fs/promises";
+import { writeFileSync, mkdtempSync } from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -567,13 +569,74 @@ const check = (name, cond, extra = "") => {
   check("think: reasoning is parsed out of the answer", r.answer === "The ball costs 5 cents.", r.answer);
   check("think: finished reply shows a Thoughts toggle + clean answer, reasoning hidden",
     /🧠 Thoughts/.test(r.finished) && /The ball costs 5 cents\./.test(r.finished) && /think-body" hidden/.test(r.finished));
-  check("think: while thinking it shows only a Thinking… pill (no answer leaked)",
-    /Thinking…/.test(r.thinking) && !/costs/.test(r.thinking));
+  check("think: reasoning streams live while thinking (visible, answer not leaked)",
+    /Thinking…/.test(r.thinking) && /working it out/.test(r.thinking) && !/think-body" hidden/.test(r.thinking) && !/costs/.test(r.thinking));
   check("think: an unclosed <think> is revealed as the answer (nothing lost)",
     /no close tag here/.test(r.unclosed) && !/Thoughts/.test(r.unclosed));
   check("think: with Think off, the answer renders plainly (no toggle)",
     /5 cents/.test(r.off) && !/Thoughts/.test(r.off));
   check("think: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
+  await page.close();
+}
+
+// ---------- Test 14d: attachments — text files read, images OCR'd, fed to model ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(String(e)));
+  // App window + a stub OCR engine so the image path is deterministic offline.
+  await page.addInitScript(() => {
+    window.name = "localai-app";
+    window.Tesseract = { createWorker: async () => ({ recognize: async () => ({ data: { text: "INVOICE TOTAL 1234" } }), terminate: async () => {} }) };
+  });
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html?thinktest=1`, { waitUntil: "load" });
+  await page.waitForTimeout(1200);
+
+  // Pure-function checks.
+  const u = await page.evaluate(() => {
+    const T = window.__thinkTest;
+    return {
+      txtA: T.isTextFile("notes.md", ""), txtB: T.isTextFile("x", "text/plain"), notImg: T.isTextFile("p.png", "image/png"),
+      fileContent: T.buildModelContent("Summarize", [{ kind: "file", name: "a.txt", mime: "text/plain", text: "HELLO CONTENT" }]),
+      imgNoText: T.buildModelContent("what is this", [{ kind: "image", name: "p.png", text: "" }]),
+    };
+  });
+  check("attach: text-file detection", u.txtA && u.txtB && !u.notImg);
+  check("attach: a text file's contents are put into the model message",
+    /a\.txt/.test(u.fileContent) && /HELLO CONTENT/.test(u.fileContent) && /Summarize/.test(u.fileContent));
+  check("attach: an unreadable image tells the model it can't see images",
+    /cannot see/i.test(u.imgNoText) && /p\.png/.test(u.imgNoText));
+
+  // Real file inputs: a text file and an image (OCR via the stub).
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "att-"));
+  const txtPath = path.join(tmp, "greeting.txt");
+  writeFileSync(txtPath, "Hello from a text file. The secret code is BANANA.");
+  const pngPath = path.join(tmp, "pic.png");
+  writeFileSync(pngPath, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64"));
+
+  await page.setInputFiles("#fileInput", txtPath);
+  await page.setInputFiles("#fileInput", pngPath);
+  // Wait until both attachments finish processing.
+  let atts = [];
+  for (let i = 0; i < 40; i++) {
+    atts = await page.evaluate(() => window.__thinkTest.getAttachments());
+    if (atts.length === 2 && atts.every((a) => a.status === "ready")) break;
+    await page.waitForTimeout(150);
+  }
+  const txt = atts.find((a) => a.kind === "file"), img = atts.find((a) => a.kind === "image");
+  check("attach: the text file is read", !!txt && /BANANA/.test(txt.text || ""), JSON.stringify(txt));
+  check("attach: the image is OCR'd into text", !!img && (img.text || "") === "INVOICE TOTAL 1234", JSON.stringify(img));
+
+  // Sending shows both in the user's bubble (model isn't loaded, so it just queues).
+  await page.fill("#input", "what do these say?");
+  await page.click("#sendBtn");
+  await page.waitForTimeout(300);
+  const bubble = await page.$eval(".msg.user .bubble", (el) => el.innerHTML).catch(() => "");
+  check("attach: sent message shows the image thumbnail and file chip + text",
+    /att-strip/.test(bubble) && /<img/.test(bubble) && /greeting\.txt/.test(bubble) && /what do these say\?/.test(bubble));
+  check("attach: the attachment tray clears after sending",
+    (await page.evaluate(() => window.__thinkTest.getAttachments())).length === 0);
+  check("attach: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
   await page.close();
 }
 
