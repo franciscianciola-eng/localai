@@ -65,6 +65,9 @@
   .att-meta{display:flex;flex-direction:column;min-width:0}
   .att-meta b{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
   .att-meta i{font-size:11px;color:var(--muted);font-style:normal;display:flex;align-items:center;gap:5px}
+  .att-chip.bad{border-color:#e5534b66} .att-chip.bad .att-meta i{color:#e5534b;white-space:normal}
+  .att-chip.bad{max-width:320px} .att-chip.bad .att-meta b{max-width:240px}
+  .bubble .notice{color:var(--warn)}
   .att-x{border:none;background:none;color:var(--muted);cursor:pointer;font-size:13px;padding:2px 4px;border-radius:6px}
   .att-x:hover{color:#e5534b;background:var(--bg)}
   .spin{width:10px;height:10px;border:2px solid var(--muted);border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite}
@@ -303,7 +306,9 @@ function replyHTML(raw, streaming){
   return h + '<div class="answer">'+render(answer)+cur+'</div>';
 }
 // Test hook (guarded): lets the e2e suite exercise the real think-parsing.
-try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })), ocrInlined:()=>OCR_INLINED, ocrDataUrl:async(u)=>{ const w=await ensureOCR(); const { data }=await w.recognize(u); return data.text; }, embedInfo:()=>EMBED, importEmbedded:()=>importEmbedded(), webllmHasModel:(id)=>hasModelInCache(id), payloadLeft:()=>document.querySelectorAll('script[type="'+EMBED_FILE_TYPE+'"]').length }; } catch {}
+try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, decodeTextBytes:(arr)=>decodeTextBytes(new Uint8Array(arr)), looksLikeGibberish, isContextOverflow:(e)=>isContextOverflow(e), contextTokens, estTokens:(s)=>estTokens(s),
+  buildMessagesFor:(hist, level, scale)=>{ const keep = history; history = hist; try { return buildMessages(level, scale); } finally { history = keep; } },
+  getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })), ocrInlined:()=>OCR_INLINED, ocrDataUrl:async(u)=>{ const w=await ensureOCR(); const { data }=await w.recognize(u); return data.text; }, embedInfo:()=>EMBED, importEmbedded:()=>importEmbedded(), webllmHasModel:(id)=>hasModelInCache(id), payloadLeft:()=>document.querySelectorAll('script[type="'+EMBED_FILE_TYPE+'"]').length }; } catch {}
 function addBubble(role, text){
   heroEl.hidden = true;
   const w = document.createElement("div"); w.className = "msg " + (role==="user"?"user":"bot");
@@ -323,8 +328,10 @@ function updateUi(){
 function showLoader(title){ loaderEl.hidden = false; $("loadTitle").textContent = title; $("barfill").style.width="0%"; $("loadPct").textContent="0%"; $("loadDetail").textContent="Preparing… (cached models load instantly)"; messagesEl.appendChild(loaderEl); chatEl.scrollTop = chatEl.scrollHeight; }
 function saveConvo(){
   try { sessionStorage.setItem("localai-std-convo", JSON.stringify(history)); }
-  catch { // over quota (usually big image thumbnails) — save again without them
-    try { sessionStorage.setItem("localai-std-convo", JSON.stringify(history.map((m) => m.atts ? { ...m, atts: m.atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime })) } : m))); } catch {}
+  catch { // over quota — save again without image thumbnails, then without file text
+    const slim = (keepText) => JSON.stringify(history.map((m) => m.atts ? { ...m, atts: m.atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime, note:a.note, ...(keepText ? { text:a.text } : {}) })) } : m));
+    try { sessionStorage.setItem("localai-std-convo", slim(true)); }
+    catch { try { sessionStorage.setItem("localai-std-convo", slim(false)); } catch {} }
   }
 }
 
@@ -450,22 +457,68 @@ async function loadModel(){
   }
 }
 
-function startGeneration(){
-  const t = THROTTLE[effectiveThrottle()];
-  const recent = history.slice(-t.historyTurns).map((m) => ({ role: m.role, content: m.content }));
-  const sys = SYSTEM_PROMPT + (thinkingMode ? THINK_INSTRUCTION : "");
-  const msgs = [{ role:"system", content: sys }, ...recent];
+/* ---- Fitting the model's context window --------------------------------------
+ * Each model reads a fixed number of tokens at once (4096 here; 1024 for the
+ * low-power Gemma build). The prompt is sized to fit, estimating tokens
+ * conservatively from characters; long attachments are cut and old turns are
+ * dropped (newest first wins). If WebLLM still reports an overflow, the reply is
+ * retried with half the attachment budget — that's "too long", not a GPU crash. */
+const CHARS_PER_TOKEN = 2.6;   // English ≈ 4, code/data ≈ 3, other scripts less
+const estTokens = (s) => Math.ceil((s || "").length / CHARS_PER_TOKEN);
+function contextTokens(level){
+  const rec = prebuiltAppConfig.model_list.find((r) => r.model_id === modelIdFor(modelSelect.value, level));
+  return (rec && rec.overrides && rec.overrides.context_window_size) || 4096;
+}
+// Thinking needs room for reasoning *and* the answer, so it gets a higher cap.
+function maxTokensFor(t){ return thinkingMode ? Math.min(1024, t.maxTokens + 320) : t.maxTokens; }
+function systemPrompt(){ return SYSTEM_PROMPT + (thinkingMode ? THINK_INSTRUCTION : ""); }
+function attachmentBudgetChars(level = effectiveThrottle()){
+  return Math.max(400, Math.floor((contextTokens(level) - maxTokensFor(THROTTLE[level]) - estTokens(systemPrompt()) - 250) * CHARS_PER_TOKEN));
+}
+function buildMessages(level, scale = 1){
+  const t = THROTTLE[level], maxTok = maxTokensFor(t), sys = systemPrompt();
+  let room = contextTokens(level) - maxTok - estTokens(sys) - 64;
+  const recent = history.slice(-t.historyTurns), out = [];
+  for (let i = recent.length - 1; i >= 0; i--){
+    const m = recent[i], newest = i === recent.length - 1;
+    let content = m.content;
+    if (m.role === "user" && m.atts && m.atts.some((a) => typeof a.text === "string")){
+      const typed = m.display || "";
+      content = buildModelContent(typed, m.atts, Math.floor(Math.max(0, room - estTokens(typed) - 90) * CHARS_PER_TOKEN * scale));
+    }
+    const cost = estTokens(content) + 6;
+    if (!newest && cost > room) break;     // older turns that don't fit are left out
+    room -= cost; out.unshift({ role: m.role, content });
+  }
+  while (out.length > 1 && out[0].role === "assistant") out.shift();
+  return { msgs: [{ role: "system", content: sys }, ...out], maxTok, t };
+}
+const isContextOverflow = (err) => !!err && (err.name === "ContextWindowSizeExceededError" || /exceed context window size/i.test(String(err.message || err)));
+// A reply that has broken down: floods of "!" (Llama's token #0 — what a model
+// emits when its numbers go bad) or invalid characters. Never legitimate text.
+function looksLikeGibberish(s){
+  if (/!{10,}/.test(s) || (s.match(/�/g) || []).length >= 3) return true;
+  return s.length >= 40 && (s.match(/!/g) || []).length / s.length > 0.3;
+}
+const GIBBERISH_NOTE = "The model's reply broke down into gibberish, so I stopped it. That usually means it was given something it couldn't read properly, or more text than it can handle — try a shorter or plain-text file. If it happens even with short messages, switch to the Qwen 0.5B model.";
+
+function startGeneration(scale = 1){
+  const { msgs, maxTok, t } = buildMessages(effectiveThrottle(), scale);
   generating = true; awaitingModel = false; setNote(null); currentText = "";
   currentBubble = addBubble("bot",""); currentBubble.innerHTML = CURSOR;
   speedChip.hidden = false; speedChip.textContent = "thinking…"; updateUi();
-  runGeneration(msgs, t);
+  runGeneration(msgs, t, maxTok, scale);
 }
-async function runGeneration(msgs, t){
+// End the turn with a short notice instead of a reply (not kept in history).
+function finishWithNotice(msg){
+  if (!currentBubble) currentBubble = addBubble("bot", "");
+  currentBubble.innerHTML = '<div class="notice">⚠️ ' + esc(msg) + '</div>';
+  generating = false; currentBubble = null; speedChip.hidden = true; updateUi(); chatEl.scrollTop = chatEl.scrollHeight;
+}
+async function runGeneration(msgs, t, maxTok, scale){
   stopFlag = false;
-  let tokens = 0, firstAt = 0, lastAt = performance.now(), watchdog = null;
+  let tokens = 0, firstAt = 0, lastAt = performance.now(), watchdog = null, garbled = false;
   try {
-    // Thinking needs room for reasoning *and* the answer, so lift the cap a bit.
-    const maxTok = thinkingMode ? Math.min(1024, t.maxTokens + 320) : t.maxTokens;
     const stream = await engine.chat.completions.create({ messages: msgs, stream: true, temperature: 0.6, top_p: 0.9, max_tokens: maxTok });
     const stall = new Promise((_, rej) => { watchdog = setInterval(() => {
       if (performance.now() - lastAt > WATCHDOG_MS){ clearInterval(watchdog); stopFlag = true; try{engine?.interruptGenerate?.()}catch{}; rej(new Error("GPU stalled — no output for "+(WATCHDOG_MS/1000)+"s")); }
@@ -476,6 +529,7 @@ async function runGeneration(msgs, t){
         const d = chunk.choices?.[0]?.delta?.content || "";
         if (d){ lastAt = performance.now(); if(!firstAt) firstAt = performance.now(); tokens++;
           currentText += d;
+          if (looksLikeGibberish(currentText)){ garbled = true; stopFlag = true; try { engine?.interruptGenerate?.(); } catch {} break; }
           if (currentBubble){ currentBubble.innerHTML = replyHTML(currentText, true); chatEl.scrollTop = chatEl.scrollHeight; }
           const el = firstAt ? (performance.now()-firstAt)/1000 : 0;
           const rate = el>0.2 ? (tokens/el).toFixed(1)+" tok/s" : "thinking…";
@@ -485,9 +539,17 @@ async function runGeneration(msgs, t){
       }
     })();
     await Promise.race([run, stall]); clearInterval(watchdog); crashCount = 0;
+    if (garbled) return finishWithNotice(GIBBERISH_NOTE);
     finishReply();
   } catch (err) {
-    clearInterval(watchdog); await onCrash(err, true);
+    clearInterval(watchdog);
+    if (isContextOverflow(err)){          // too much text — not a GPU problem
+      if (currentBubble){ currentBubble.parentElement?.remove(); currentBubble = null; }
+      generating = false; speedChip.hidden = true;
+      if (scale > 0.2) return startGeneration(scale / 2);
+      return finishWithNotice("That's more text than this model can read at once. Try a shorter file, or paste just the part you need.");
+    }
+    await onCrash(err, true);
   }
 }
 function finishReply(){
@@ -525,12 +587,138 @@ const OCR_CDN_PATHS = {
   corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
   langPath: "https://tessdata.projectnaptha.com/4.0.0",
 };
-const TEXT_EXT = new Set(["txt","md","markdown","csv","tsv","json","js","mjs","ts","jsx","tsx","py","rb","go","rs","java","c","h","cpp","cc","hpp","cs","php","swift","kt","sh","bash","zsh","yaml","yml","toml","ini","cfg","conf","xml","html","htm","css","scss","less","sql","log","tex","srt","vtt","env","gitignore","dockerfile"]);
-const FILE_TEXT_LIMIT = 8000;
+// Files are judged by their CONTENT, not their name or MIME type: Word/Excel/
+// PowerPoint files are ZIP archives (their MIME types contain "xml", which once
+// let raw compressed bytes through to the model as gibberish). Office and
+// OpenDocument files are unzipped and their text extracted; anything else is
+// read as text only if the bytes actually are text.
+const FILE_TEXT_LIMIT = 24000;           // stored per file; trimmed to fit the model at send time
+const OFFICE = { docx: "Word", pptx: "PowerPoint", xlsx: "Excel", odt: "OpenDocument", odp: "OpenDocument", ods: "OpenDocument" };
+const LEGACY = { doc: ".docx", xls: ".xlsx", ppt: ".pptx" };
 let _ocr = null, _ocrLoading = null;
 
 function extOf(name){ const i = name.lastIndexOf("."); return i >= 0 ? name.slice(i+1).toLowerCase() : ""; }
-function isTextFile(file){ return (file.type && file.type.startsWith("text/")) || TEXT_EXT.has(extOf(file.name||"")) || /json|xml|javascript|csv/.test(file.type||""); }
+// Heuristic binary check on the first 8 KB: NUL bytes or >2% control characters.
+function looksBinary(bytes){
+  const n = Math.min(bytes.length, 8192); let ctrl = 0;
+  for (let i = 0; i < n; i++){ const b = bytes[i]; if (b === 0) return true; if (b < 9 || (b > 13 && b < 32)) ctrl++; }
+  return n > 0 && ctrl / n > 0.02;
+}
+// Bytes → text, or null if it isn't text. Handles UTF-16 BOMs and falls back to
+// Windows-1252 for old non-UTF-8 text files.
+function decodeTextBytes(bytes){
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE) return new TextDecoder("utf-16le").decode(bytes);
+  if (bytes[0] === 0xFE && bytes[1] === 0xFF) return new TextDecoder("utf-16be").decode(bytes);
+  if (looksBinary(bytes)) return null;
+  let s = new TextDecoder("utf-8").decode(bytes);
+  if ((s.match(/�/g) || []).length > s.length * 0.005) s = new TextDecoder("windows-1252").decode(bytes);
+  return s;
+}
+function decodeEntities(s){
+  return s.replace(/&(?:#(\d+)|#x([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g, (m, d, h, n) => {
+    if (n) return { amp:"&", lt:"<", gt:">", quot:'"', apos:"'" }[n];
+    const cp = d ? +d : parseInt(h, 16);
+    return cp > 0 && cp <= 0x10FFFF ? String.fromCodePoint(cp) : "";
+  });
+}
+// Minimal ZIP reader: walks the central directory and inflates the wanted
+// entries with the browser's built-in DecompressionStream — no library, no network.
+async function unzip(buf, want){
+  const dv = new DataView(buf), n = buf.byteLength;
+  let eocd = -1;
+  for (let i = n - 22; i >= Math.max(0, n - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50){ eocd = i; break; }
+  if (eocd < 0) throw new Error("this file looks damaged (it isn't a valid document)");
+  const count = dv.getUint16(eocd + 10, true), dec = new TextDecoder(), out = new Map();
+  let p = dv.getUint32(eocd + 16, true);
+  for (let k = 0; k < count && p + 46 <= n && dv.getUint32(p, true) === 0x02014b50; k++){
+    const method = dv.getUint16(p + 10, true), size = dv.getUint32(p + 20, true), local = dv.getUint32(p + 42, true);
+    const nameLen = dv.getUint16(p + 28, true), name = dec.decode(new Uint8Array(buf, p + 46, nameLen));
+    p += 46 + nameLen + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true);
+    if (!want(name) || local + 30 > n) continue;
+    const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
+    const data = new Uint8Array(buf, start, Math.min(size, n - start));
+    if (method === 0) out.set(name, dec.decode(data));
+    else if (method === 8) out.set(name, dec.decode(await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer()));
+  }
+  return out;
+}
+const numIn = (s) => +((s.match(/(\d+)\.xml$/) || [])[1] || 0);
+function docxText(xml){        // paragraphs → lines; keep text runs, tabs and breaks
+  return decodeEntities(xml.split(/<\/w:p>/).map((p) =>
+    (p.match(/<w:t(?:\s[^>]*)?>[^<]*<\/w:t>|<w:tab\/>|<w:br\b[^>]*\/>|<w:cr\/>/g) || [])
+      .map((tok) => tok.startsWith("<w:tab") ? "\t" : (tok.startsWith("<w:br") || tok.startsWith("<w:cr")) ? "\n" : tok.replace(/<[^>]+>/g, "")).join("")
+  ).join("\n"));
+}
+function slideText(xml){       // PowerPoint slide: DrawingML text runs
+  return decodeEntities(xml.split(/<\/a:p>/).map((p) =>
+    (p.match(/<a:t(?:\s[^>]*)?>[^<]*<\/a:t>|<a:br\b[^>]*\/>/g) || []).map((tok) => tok.startsWith("<a:br") ? "\n" : tok.replace(/<[^>]+>/g, "")).join("")
+  ).filter((s) => s.trim()).join("\n"));
+}
+function sheetText(xml, shared){   // Excel sheet → tab-separated rows (keeps empty columns)
+  const col = (ref) => { let c = 0; for (const ch of (ref.match(/^[A-Z]+/) || [""])[0]) c = c * 26 + ch.charCodeAt(0) - 64; return c - 1; };
+  const rows = [];
+  for (const row of xml.match(/<row\b[\s\S]*?<\/row>/g) || []){
+    const cells = [];
+    for (const c of row.match(/<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g) || []){
+      const ref = (c.match(/\br="([A-Z]+\d+)"/) || [])[1], t = (c.match(/\bt="([^"]+)"/) || [])[1], v = (c.match(/<v>([^<]*)<\/v>/) || [])[1];
+      const val = t === "s" ? (shared[+v] ?? "") : t === "inlineStr" ? decodeEntities((c.match(/<t(?:\s[^>]*)?>([^<]*)<\/t>/) || [])[1] || "") : v !== undefined ? decodeEntities(v) : "";
+      cells[ref ? col(ref) : cells.length] = val;
+    }
+    const line = Array.from(cells, (x) => x ?? "").join("\t");
+    if (line.trim()) rows.push(line);
+  }
+  return rows.join("\n");
+}
+function odfText(xml){         // OpenDocument content.xml (text, slides, sheets)
+  return decodeEntities(xml.replace(/<text:tab\/>/g, "\t").replace(/<text:line-break\/>/g, "\n")
+    .replace(/<text:s(?:\s+text:c="(\d+)")?\/>/g, (m, c) => " ".repeat(+c || 1))
+    .replace(/<\/text:(?:p|h)>/g, "\n").replace(/<\/table:table-cell>/g, "\t").replace(/<\/table:table-row>/g, "\n")
+    .replace(/<[^>]+>/g, ""));
+}
+async function extractOffice(buf, ext){
+  if (ext === "docx"){
+    const xml = (await unzip(buf, (n) => n === "word/document.xml")).get("word/document.xml");
+    if (!xml) throw new Error("couldn't find the text inside this Word file");
+    return docxText(xml);
+  }
+  if (ext === "pptx"){
+    const slides = [...(await unzip(buf, (n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))).entries()].sort((a, b) => numIn(a[0]) - numIn(b[0]));
+    return slides.map(([, xml], i) => "Slide " + (i + 1) + ":\n" + slideText(xml)).join("\n\n");
+  }
+  if (ext === "xlsx"){
+    const files = await unzip(buf, (n) => n === "xl/sharedStrings.xml" || /^xl\/worksheets\/sheet\d+\.xml$/.test(n));
+    const shared = ((files.get("xl/sharedStrings.xml") || "").match(/<si>[\s\S]*?<\/si>/g) || [])
+      .map((si) => decodeEntities((si.match(/<t(?:\s[^>]*)?>[^<]*<\/t>/g) || []).map((t) => t.replace(/<[^>]+>/g, "")).join("")));
+    const sheets = [...files.entries()].filter(([n]) => n.startsWith("xl/worksheets/")).sort((a, b) => numIn(a[0]) - numIn(b[0]));
+    return sheets.map(([, xml], i) => "Sheet " + (i + 1) + ":\n" + sheetText(xml, shared)).join("\n\n");
+  }
+  const xml = (await unzip(buf, (n) => n === "content.xml")).get("content.xml");   // odt / odp / ods
+  if (!xml) throw new Error("couldn't find the text inside this document");
+  return odfText(xml);
+}
+function tidyText(text){ return text.replace(/\r\n?/g, "\n").replace(/[ \t]+\n/g, "\n").replace(/\n{4,}/g, "\n\n\n").trim(); }
+// Read any attached (non-image) file into plain text, or throw a friendly reason.
+async function readDocument(file){
+  const ext = extOf(file.name || "");
+  let text, note = "";
+  if (OFFICE[ext]){
+    text = tidyText(await extractOffice(await file.arrayBuffer(), ext));
+    if (!text) throw new Error("no text found in this " + OFFICE[ext] + " file");
+    note = OFFICE[ext] + " text extracted";
+  } else if (ext === "pdf" || file.type === "application/pdf"){
+    throw new Error("PDFs can't be read yet — attach a screenshot of the page instead");
+  } else if (LEGACY[ext]){
+    throw new Error("old ." + ext + " format — re-save it as " + LEGACY[ext] + " and attach that");
+  } else {
+    const head = new Uint8Array(await file.slice(0, 2 * 1024 * 1024).arrayBuffer());
+    const decoded = decodeTextBytes(head);
+    if (decoded === null) throw new Error("not a text file — attach text, documents or images");
+    text = tidyText(decoded);
+    if (file.size > head.length) note = "big file — only the start is used";
+  }
+  if (text.length > FILE_TEXT_LIMIT){ text = text.slice(0, FILE_TEXT_LIMIT); note = "long — only the start is used"; }
+  return { text, note };
+}
 function fileToDataURL(file){ return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); }); }
 function downscale(dataUrl, maxDim){ return new Promise((res) => { const img = new Image(); img.onload = () => { let w = img.width, h = img.height; const scale = Math.min(1, maxDim/Math.max(w,h)); const cw = Math.max(1,Math.round(w*scale)), ch = Math.max(1,Math.round(h*scale)); const c = document.createElement("canvas"); c.width = cw; c.height = ch; c.getContext("2d").drawImage(img,0,0,cw,ch); try { res(c.toDataURL("image/png")); } catch { res(dataUrl); } }; img.onerror = () => res(dataUrl); img.src = dataUrl; }); }
 function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("couldn't load "+src)); document.head.appendChild(s); }); }
@@ -592,18 +780,15 @@ async function handleFiles(list){
         renderAttachRow();
         runOCR(att, await downscale(full, 1600));   // async; enables send when done
       } catch { att.status = "ready"; att.note = "couldn't read image"; renderAttachRow(); updateUi(); }
-    } else if (isTextFile(file)){
-      const att = { id, kind:"file", name:file.name || "file.txt", mime:file.type || "text/plain", status:"reading", text:"", note:"" };
+    } else {
+      const att = { id, kind:"file", name:file.name || "file", mime:file.type || "text/plain", status:"reading", text:"", note:"" };
       attachments.push(att); renderAttachRow(); updateUi();
       try {
-        let txt = await file.text();
-        if (txt.length > FILE_TEXT_LIMIT) txt = txt.slice(0, FILE_TEXT_LIMIT) + "\n…[truncated; " + txt.length + " chars total]";
-        att.text = txt; att.note = "";
-      } catch { att.note = "couldn't read file"; }
+        const r = await readDocument(file);
+        att.text = r.text;
+        att.note = r.note || (att.text.length > attachmentBudgetChars() ? "long — the model will read the first part" : "");
+      } catch (e) { att.text = ""; att.bad = true; att.note = (e && e.message) || "couldn't read this file"; }
       att.status = "ready"; renderAttachRow(); updateUi();
-    } else {
-      attachments.push({ id, kind:"file", name:file.name || "file", mime:file.type || "?", status:"ready", text:"", note:"unsupported — text & images only" });
-      renderAttachRow(); updateUi();
     }
   }
 }
@@ -614,24 +799,37 @@ function renderAttachRow(){
     const busy = a.status === "reading" || a.status === "ocr";
     const label = a.status === "ocr" ? "reading text…" : a.status === "reading" ? "reading…" : (a.note || "ready");
     const visual = (a.kind === "image" && a.thumb) ? '<img src="'+a.thumb+'">' : '<span class="ic">📄</span>';
-    return '<span class="att-chip">' + visual +
+    return '<span class="att-chip' + (a.bad ? ' bad' : '') + '">' + visual +
       '<span class="att-meta"><b>'+esc(a.name)+'</b><i>'+(busy?'<span class="spin"></span>':'')+esc(label)+'</i></span>' +
       '<button class="att-x" data-remove="'+a.id+'" title="Remove">✕</button></span>';
   }).join("");
 }
 function attProcessing(){ return attachments.some((a) => a.status === "reading" || a.status === "ocr"); }
-function buildModelContent(typed, atts){
-  let pre = "";
-  for (const a of atts){
-    if (a.kind === "image"){
-      const t = (a.text || "").trim();
-      pre += t
-        ? '\n[Image "'+a.name+'" — you cannot see it, but this text was read from it via OCR]\n'+t+'\n'
-        : '\n[Image "'+a.name+'" attached — no readable text was found, and you cannot see images directly.]\n';
-    } else if (a.text){
-      pre += '\n[File "'+a.name+'" ('+a.mime+')]\n'+a.text+'\n';
-    }
+// The model's view of a message with attachments. `budget` caps the total
+// characters of attachment text (shared fairly: short files keep everything,
+// long ones are cut) so the whole prompt fits the model's context window.
+function buildModelContent(typed, atts, budget = Infinity){
+  const texts = atts.map((a) => (a.text || "").trim());
+  const keep = texts.map(() => 0);
+  let left = budget, pending = texts.map((t, i) => i).filter((i) => texts[i]).sort((a, b) => texts[a].length - texts[b].length);
+  while (pending.length){
+    const share = Math.floor(left / pending.length), i = pending.shift();
+    keep[i] = Math.min(texts[i].length, Math.max(0, share)); left -= keep[i];
   }
+  const cut = (i) => texts[i].length > keep[i]
+    ? texts[i].slice(0, keep[i]) + "\n[…the rest of this file didn't fit — only the part above was read]" : texts[i];
+  let pre = "";
+  atts.forEach((a, i) => {
+    if (a.kind === "image"){
+      pre += texts[i]
+        ? '\n[Image "'+a.name+'" — you cannot see it, but this text was read from it via OCR]\n'+cut(i)+'\n'
+        : '\n[Image "'+a.name+'" attached — no readable text was found, and you cannot see images directly.]\n';
+    } else if (texts[i]){
+      pre += '\n[File "'+a.name+'"]\n'+cut(i)+'\n';
+    } else if (a.note){
+      pre += '\n[File "'+a.name+'" was attached but could not be read ('+a.note+').]\n';
+    }
+  });
   if (pre) pre = "The user shared the following. Use it to answer their message.\n" + pre + "\n";
   return (pre + (typed || "")).trim();
 }
@@ -655,12 +853,14 @@ function send(text){
   const atts = attachments.slice();
   if (!typed && !atts.length) return;
   if (attProcessing()){ setNote("Still reading the attachment — one moment…", true); return; }
-  const modelContent = buildModelContent(typed, atts);
-  const displayAtts = atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime, thumb:a.thumb }));
+  // Keep each attachment's text with the message: the model's view is rebuilt
+  // at send time (buildMessages) so it always fits the current model's window,
+  // and follow-up questions can still see the file.
+  const msgAtts = atts.map((a) => ({ kind:a.kind, name:a.name, mime:a.mime, thumb:a.thumb, text:a.text || "", note:a.note || "" }));
   inputEl.value = ""; inputEl.style.height = "auto";
   attachments = []; renderAttachRow();
-  addUserMessage(typed, displayAtts);
-  history.push({ role:"user", content: modelContent, display: typed, atts: displayAtts });
+  addUserMessage(typed, msgAtts);
+  history.push({ role:"user", content: typed || "(see the attached file)", display: typed, atts: msgAtts });
   crashCount = 0; saveConvo();
   if (ready) startGeneration();
   else { awaitingModel = true; setNote("Model is still loading — your message will send automatically when it's ready.", true); updateUi(); }

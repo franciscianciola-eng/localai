@@ -262,9 +262,14 @@ three requested models — **Qwen2.5 0.5B, Llama 3.2 1B, Gemma 2 2B** — runnin
   makes these small models much more accurate), streaming the reasoning live and
   then collapsing it into a "Thoughts" toggle, leaving a clean answer.
 - **Attachments** (📎, drag-drop, or paste) — text/code/data files are read and
-  given to the model; images are shown inline and run through **OCR** so the
-  model can read any text in them. These are text-only models, so images without
-  text are labelled as such (they can't "see" pictures).
+  given to the model, and **Word, PowerPoint and Excel** files (`.docx/.pptx/.xlsx`,
+  plus OpenDocument) are unzipped in the browser and their text extracted; images
+  are shown inline and run through **OCR** so the model can read any text in them.
+  Files are judged by their bytes, so binary files are refused rather than fed to
+  the model; PDFs and old `.doc/.xls/.ppt` get a clear "how to attach this" note.
+  Long files are trimmed so the whole prompt fits the model's context window, and
+  a reply that degenerates into gibberish is stopped with an explanation. These
+  are text-only models, so images without text are labelled as such.
 
 Notes:
 

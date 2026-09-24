@@ -10,6 +10,7 @@ import { readFile } from "fs/promises";
 import { writeFileSync, mkdtempSync, mkdirSync, readFileSync } from "fs";
 import { randomBytes, createHash } from "crypto";
 import { execFileSync } from "child_process";
+import { deflateRawSync } from "zlib";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -600,12 +601,14 @@ const check = (name, cond, extra = "") => {
   const u = await page.evaluate(() => {
     const T = window.__thinkTest;
     return {
-      txtA: T.isTextFile("notes.md", ""), txtB: T.isTextFile("x", "text/plain"), notImg: T.isTextFile("p.png", "image/png"),
+      txt: T.decodeTextBytes(Array.from(new TextEncoder().encode("hello, world\n"))),
+      zip: T.decodeTextBytes([0x50, 0x4b, 3, 4, 20, 0, 0, 0, 8, 0, 0x99, 0x88]),   // a .docx starts like this
+      utf16: T.decodeTextBytes([0xFF, 0xFE, 0x68, 0, 0x69, 0]),
       fileContent: T.buildModelContent("Summarize", [{ kind: "file", name: "a.txt", mime: "text/plain", text: "HELLO CONTENT" }]),
       imgNoText: T.buildModelContent("what is this", [{ kind: "image", name: "p.png", text: "" }]),
     };
   });
-  check("attach: text-file detection", u.txtA && u.txtB && !u.notImg);
+  check("attach: files are judged by their bytes (text ok, zip/binary rejected, UTF-16 ok)", u.txt === "hello, world\n" && u.zip === null && u.utf16 === "hi", JSON.stringify([u.txt, u.zip, u.utf16]));
   check("attach: a text file's contents are put into the model message",
     /a\.txt/.test(u.fileContent) && /HELLO CONTENT/.test(u.fileContent) && /Summarize/.test(u.fileContent));
   check("attach: an unreadable image tells the model it can't see images",
@@ -641,6 +644,104 @@ const check = (name, cond, extra = "") => {
   check("attach: the attachment tray clears after sending",
     (await page.evaluate(() => window.__thinkTest.getAttachments())).length === 0);
   check("attach: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
+  await page.close();
+}
+
+// ---------- Test 14h: Office files → real text; binary never reaches the model ----------
+// Regression: .docx/.xlsx/.pptx MIME types contain "xml", so they used to be
+// read as text — the model got raw ZIP bytes and replied with "!!!!" gibberish.
+{
+  // Tiny ZIP writer (deflate + CRC-32) so the test can build real Office files.
+  const crcTable = Array.from({ length: 256 }, (_, n) => { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; return c >>> 0; });
+  const crc32 = (buf) => { let c = 0xFFFFFFFF; for (const b of buf) c = crcTable[(c ^ b) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  const makeZip = (entries) => {
+    const locals = [], centrals = []; let offset = 0;
+    for (const [name, text] of entries) {
+      const raw = Buffer.from(text), comp = deflateRawSync(raw), nm = Buffer.from(name), crc = crc32(raw);
+      const lh = Buffer.alloc(30); lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(8, 8);
+      lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(comp.length, 18); lh.writeUInt32LE(raw.length, 22); lh.writeUInt16LE(nm.length, 26);
+      const ch = Buffer.alloc(46); ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(8, 10);
+      ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(comp.length, 20); ch.writeUInt32LE(raw.length, 24); ch.writeUInt16LE(nm.length, 28); ch.writeUInt32LE(offset, 42);
+      locals.push(lh, nm, comp); centrals.push(ch, nm); offset += 30 + nm.length + comp.length;
+    }
+    const cd = Buffer.concat(centrals), end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10); end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
+    return Buffer.concat([...locals, cd, end]);
+  };
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "docs-"));
+  const put = (name, data) => { const p = path.join(tmp, name); writeFileSync(p, data); return p; };
+  const files = [
+    put("notes.docx", makeZip([["[Content_Types].xml", "<Types/>"], ["word/document.xml",
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Biology notes</w:t></w:r></w:p>' +
+      '<w:p><w:r><w:t xml:space="preserve">Mitochondria make ATP &amp; heat.</w:t></w:r><w:r><w:tab/><w:t>End</w:t></w:r></w:p></w:body></w:document>']])),
+    put("deck.pptx", makeZip([["ppt/slides/slide2.xml", "<p:sld><a:p><a:r><a:t>Second slide</a:t></a:r></a:p></p:sld>"],
+      ["ppt/slides/slide1.xml", "<p:sld><a:p><a:r><a:t>Photosynthesis</a:t></a:r></a:p><a:p><a:r><a:t>Light + water</a:t></a:r></a:p></p:sld>"]])),
+    put("grades.xlsx", makeZip([["xl/sharedStrings.xml", "<sst><si><t>Name</t></si><si><t>Score</t></si><si><t>Ada</t></si></sst>"],
+      ["xl/worksheets/sheet1.xml", '<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>' +
+      '<row r="2"><c r="A2" t="s"><v>2</v></c><c r="C2"><v>97</v></c></row></sheetData></worksheet>']])),
+    put("junk.bin", randomBytes(4096)),
+    put("old.doc", Buffer.concat([Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]), randomBytes(2048)])),
+    put("paper.pdf", Buffer.from("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n1 0 obj\n", "latin1")),
+  ];
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  const errs = [];
+  page.on("pageerror", (e) => errs.push(String(e)));
+  await page.addInitScript(() => { window.name = "localai-app"; });
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html?thinktest=1`, { waitUntil: "load" });
+  await page.waitForTimeout(1000);
+  await page.setInputFiles("#fileInput", files);
+  let atts = [];
+  for (let i = 0; i < 60; i++) {
+    atts = await page.evaluate(() => window.__thinkTest.getAttachments());
+    if (atts.length === 6 && atts.every((a) => a.status === "ready")) break;
+    await page.waitForTimeout(100);
+  }
+  const by = (n) => atts.find((a) => a.name === n) || {};
+  check("docs: Word text is extracted (paragraphs, &-entities, tabs)", by("notes.docx").text === "Biology notes\nMitochondria make ATP & heat.\tEnd", JSON.stringify(by("notes.docx").text));
+  check("docs: PowerPoint text is extracted in slide order", by("deck.pptx").text === "Slide 1:\nPhotosynthesis\nLight + water\n\nSlide 2:\nSecond slide", JSON.stringify(by("deck.pptx").text));
+  check("docs: Excel cells come out as rows (empty columns kept)", by("grades.xlsx").text === "Sheet 1:\nName\t\tScore\nAda\t\t97", JSON.stringify(by("grades.xlsx").text));
+  check("docs: a binary file is refused, not fed to the model", by("junk.bin").text === "" && /not a text file/.test(by("junk.bin").note), by("junk.bin").note);
+  check("docs: old .doc files get a clear 're-save as .docx' message", /re-save it as \.docx/.test(by("old.doc").note), by("old.doc").note);
+  check("docs: PDFs get a clear message (use a screenshot)", /PDFs can't be read/.test(by("paper.pdf").note), by("paper.pdf").note);
+  const view = await page.evaluate(() => window.__thinkTest.buildModelContent("summarize these", window.__thinkTest.getAttachments()));
+  check("docs: the model sees the extracted text and an honest note for the unreadable file — never raw bytes",
+    /Biology notes/.test(view) && /"junk\.bin" was attached but could not be read/.test(view) && !/�|PK\u0003\u0004/.test(view));
+
+  // Fitting the context window.
+  const fit = await page.evaluate(() => {
+    const T = window.__thinkTest, big = "The quick brown fox jumps over the lazy dog. ".repeat(1500);   // ~68k chars
+    const hist = [
+      { role: "user", content: "old question", display: "old question" },
+      { role: "assistant", content: "old answer. ".repeat(60) },
+      { role: "user", content: "summarize this", display: "summarize this", atts: [{ kind: "file", name: "big.txt", text: big, note: "" }] },
+    ];
+    const tokensOf = (r) => r.msgs.reduce((s, m) => s + T.estTokens(m.content), 0);
+    const r = T.buildMessagesFor(hist, 0, 1), half = T.buildMessagesFor(hist, 0, 0.5);
+    const follow = T.buildMessagesFor([...hist.slice(2), { role: "assistant", content: "It is about a fox." }, { role: "user", content: "what animal jumps?", display: "what animal jumps?" }], 0, 1);
+    return { total: tokensOf(r), half: tokensOf(half), maxTok: r.maxTok, ctx: T.contextTokens(0), last: r.msgs[r.msgs.length - 1].content,
+      follow: follow.msgs.map((m) => m.role + ":" + m.content.slice(0, 40)), followTotal: tokensOf(follow) };
+  });
+  check("fit: a huge file is cut so the whole prompt fits the model's window", fit.total + fit.maxTok <= fit.ctx, `${fit.total}+${fit.maxTok} vs ${fit.ctx}`);
+  check("fit: the user's question survives at the end, with a note the file was cut", /summarize this$/.test(fit.last) && /didn't fit/.test(fit.last));
+  check("fit: an overflow retry sends less", fit.half < fit.total, `${fit.half} < ${fit.total}`);
+  check("fit: a follow-up question still includes the (trimmed) file", fit.follow.length === 4 && /The user shared/.test(fit.follow[1]) && /what animal jumps/.test(fit.follow[3]) && fit.followTotal + fit.maxTok <= fit.ctx, JSON.stringify(fit.follow));
+
+  // Gibberish guard — using the actual broken reply that was reported.
+  const g = await page.evaluate(() => {
+    const T = window.__thinkTest;
+    return {
+      reported: T.looksLikeGibberish("!.fd-inple-rem-ore!!-&('!!!!!!!!!!!ire-"),
+      normal: T.looksLikeGibberish("Great question! The ball costs 5 cents, not 10. Wow!!"),
+      replacement: T.looksLikeGibberish("I �and � minor � thing"),
+      overflow: T.isContextOverflow(Object.assign(new Error("Prompt tokens exceed context window size: number of prompt tokens: 5000; context window size: 4096"), { name: "ContextWindowSizeExceededError" })),
+      gpu: T.isContextOverflow(new Error("GPU stalled — no output for 30s")),
+    };
+  });
+  check("guard: the reported '!!!!' reply is caught within its first 40 characters", g.reported === true);
+  check("guard: normal replies (even with a few !s) are left alone", g.normal === false);
+  check("guard: replies full of invalid characters are caught", g.replacement === true);
+  check("guard: 'prompt too long' is told apart from a GPU crash", g.overflow === true && g.gpu === false);
+  check("docs: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
   await page.close();
 }
 
