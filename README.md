@@ -222,6 +222,29 @@ npm install
 npm test          # runs test/e2e.mjs against a local Chromium
 ```
 
+## One file with the model built in — no download at all
+
+**Download:** https://github.com/franciscianciola-eng/localai/releases/download/offline-models/LocalAI-Qwen2.5-0.5B-offline.html
+
+A single HTML file (~400 MB) with the **Qwen2.5 0.5B** model inside it. Double-click
+it and chat: nothing downloads, no internet needed, ever. The first open takes a
+bit longer while it unpacks the model into the browser; later opens are quick.
+
+- **How:** `build-embedded.mjs` appends the model's files (config, tokenizer,
+  weight shards, compiled WebGPU library) to the single-file app as base64
+  chunks. On open, the app writes them into the exact Cache Storage entries
+  WebLLM would create after a download, so WebLLM loads with no network.
+- **Built by GitHub Actions** (`.github/workflows/offline-models.yml`), which
+  downloads the weights from Hugging Face and publishes the file as a release.
+  To build it yourself: `python3 offline-package/download-models.py --only qwen`
+  then `node build-embedded.mjs --models qwen`.
+- **Why only one model per file, and why the 0.5B:** a file's size is roughly
+  the model's size plus a third (base64). The 0.5B makes a ~400 MB file that a
+  Chromebook opens fine; the 1B would be ~950 MB (heavy — may not open on a 4 GB
+  Chromebook) and the 2B ~2 GB; all three together would be ~3.3 GB, which a
+  browser can't hold in memory to open at all. `build-embedded.mjs --models llama`
+  can build the 1B on its own if you have a roomier machine.
+
 ## One local file for a Chromebook (`localai-standalone.html`)
 
 There's also a **single self-contained HTML file** you can keep on a Chromebook

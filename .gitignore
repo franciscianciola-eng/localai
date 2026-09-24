@@ -5,6 +5,9 @@ package-lock.json
 offline-package/models/*
 !offline-package/models/README.md
 
+# Built files with a model inside (hundreds of MB; published as release downloads)
+dist/
+
 # Python bytecode cache
 __pycache__/
 *.pyc

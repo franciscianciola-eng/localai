@@ -1,0 +1,59 @@
+name: Build the single file with the model built in
+
+# Builds LocalAI-Qwen2.5-0.5B-offline.html — the one-file app with the model
+# inside it, so it needs no download at all — and publishes it as a release
+# download. (It's ~400 MB: too big for the repo or GitHub Pages, fine for a
+# release asset.) The weights come from Hugging Face on GitHub's runner.
+
+on:
+  push:
+    branches: [main, master, "claude/**"]
+    paths:
+      - standalone.template.html
+      - build-standalone.mjs
+      - build-embedded.mjs
+      - vendor/**
+      - offline-package/download-models.py
+      - .github/workflows/offline-models.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: offline-models
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build the single-file app
+        run: node build-standalone.mjs
+
+      - name: Download Qwen2.5 0.5B (weights, tokenizer, WebGPU library)
+        run: python3 offline-package/download-models.py --only qwen
+
+      - name: Build the file with the model built in
+        run: node --no-warnings build-embedded.mjs --models qwen --out dist/LocalAI-Qwen2.5-0.5B-offline.html
+
+      - name: Publish as a release download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=offline-models
+          NOTES="**LocalAI with the Qwen2.5 0.5B model built in.** Download the .html file below and double-click it: it opens and chats with no download and no internet (needs Chrome/Edge with WebGPU, e.g. any recent Chromebook). The first open takes a little longer while it unpacks the model; after that it opens quickly. Built from ${GITHUB_SHA::7}. Qwen2.5-0.5B-Instruct © Alibaba Cloud, Apache-2.0."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "LocalAI — model built in (no download)" --notes "$NOTES"
+          fi
+          gh release upload "$TAG" dist/LocalAI-Qwen2.5-0.5B-offline.html --clobber
+          echo "Download: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/LocalAI-Qwen2.5-0.5B-offline.html" >> "$GITHUB_STEP_SUMMARY"

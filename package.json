@@ -6,6 +6,7 @@
   "scripts": {
     "build:standalone": "node build-standalone.mjs",
     "build:offline": "node build-offline.mjs",
+    "build:embedded": "node --no-warnings build-embedded.mjs",
     "test": "node test/e2e.mjs"
   },
   "devDependencies": {

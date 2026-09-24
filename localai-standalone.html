@@ -106,7 +106,7 @@
   <div class="inner" id="messages">
     <div class="hero" id="hero">
       <h1>A private AI in one local file</h1>
-      <p>Runs entirely on your device with WebGPU. Each model downloads once (from the web),
+      <p id="heroText">Runs entirely on your device with WebGPU. Each model downloads once (from the web),
          then works <b>fully offline</b>. Nothing you type ever leaves your device.</p>
       <div class="suggestions">
         <button data-q="Explain how a rainbow forms, in three sentences.">Explain a rainbow</button>
@@ -15191,13 +15191,39 @@ try { const v = localStorage.getItem("localai-std-think"); if (v !== null) think
 let attachments = [], attId = 0;   // pending attachments for the next message
 function syncThinkBtn(){ thinkBtn.classList.toggle("on", thinkingMode); thinkBtn.textContent = thinkingMode ? "🧠 Think" : "🧠 Think: off"; thinkBtn.title = thinkingMode ? "Thinking on — the model reasons before answering (reasoning stays hidden). Click to turn off." : "Thinking off — the model answers directly. Click to turn on."; }
 
+// ---- Models built into this file (optional) ---------------------------------
+// A build of this page can carry model files inside it (build-embedded.mjs): a
+// JSON manifest plus base64 chunks in inert <script> elements. On open they're
+// unpacked into the exact Cache Storage entries WebLLM creates after a download
+// (webllm/config, webllm/model, webllm/wasm), so the model loads with no network.
+const EMBED_FILE_TYPE = "application/x-localai-file";
+const EMBED = (() => {
+  try {
+    const el = document.getElementById("localaiEmbedded");
+    const m = el ? JSON.parse(el.textContent) : null;
+    return (m && Array.isArray(m.models) && m.models.length && Array.isArray(m.files)) ? m : null;
+  } catch { return null; }
+})();
+const isBuiltIn = (key) => !!(EMBED && EMBED.models.includes(key));
+let embedImported = !EMBED;   // a normal build has nothing to unpack
+
 for (const [k, m] of Object.entries(MODELS)) {
-  const o = document.createElement("option"); o.value = k; o.textContent = m.label; modelSelect.appendChild(o);
+  const o = document.createElement("option"); o.value = k;
+  o.textContent = m.label + (EMBED ? (isBuiltIn(k) ? " · built in ✓" : " · downloads once") : "");
+  modelSelect.appendChild(o);
 }
 let savedModel = DEFAULT_MODEL;
 try { savedModel = localStorage.getItem("localai-std-model") || DEFAULT_MODEL; } catch {}
 if (!MODELS[savedModel]) savedModel = DEFAULT_MODEL;
+// A file with a model built in always opens on that model, so nothing downloads.
+if (EMBED && !isBuiltIn(savedModel)) savedModel = EMBED.models.find((k) => MODELS[k]) || savedModel;
 modelSelect.value = savedModel;
+if (EMBED){
+  const names = EMBED.models.filter((k) => MODELS[k]).map((k) => MODELS[k].label.split(" — ")[0]).join(" and ");
+  $("heroText").innerHTML = "The <b>" + esc(names) + "</b> model is <b>built into this file</b> — nothing to download. " +
+    "It runs entirely on your device with WebGPU and works <b>fully offline</b>. Nothing you type ever leaves your device." +
+    (EMBED.notice ? '<span class="meta" style="display:block;margin-top:8px">' + esc(EMBED.notice) + "</span>" : "");
+}
 
 function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 function render(t){
@@ -15243,14 +15269,17 @@ function replyHTML(raw, streaming){
   return h + '<div class="answer">'+render(answer)+cur+'</div>';
 }
 // Test hook (guarded): lets the e2e suite exercise the real think-parsing.
-try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })), ocrInlined:()=>OCR_INLINED, ocrDataUrl:async(u)=>{ const w=await ensureOCR(); const { data }=await w.recognize(u); return data.text; } }; } catch {}
+try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })), ocrInlined:()=>OCR_INLINED, ocrDataUrl:async(u)=>{ const w=await ensureOCR(); const { data }=await w.recognize(u); return data.text; }, embedInfo:()=>EMBED, importEmbedded:()=>importEmbedded(), webllmHasModel:(id)=>hasModelInCache(id), payloadLeft:()=>document.querySelectorAll('script[type="'+EMBED_FILE_TYPE+'"]').length }; } catch {}
 function addBubble(role, text){
   heroEl.hidden = true;
   const w = document.createElement("div"); w.className = "msg " + (role==="user"?"user":"bot");
   const b = document.createElement("div"); b.className = "bubble"; b.innerHTML = render(text);
   w.appendChild(b); messagesEl.appendChild(w); chatEl.scrollTop = chatEl.scrollHeight; return b;
 }
-function setNote(t, warn){ footNote.textContent = (t || "One local HTML file · WebGPU · each model downloads once, then runs offline") ; footNote.className = "foot-note" + (warn?" warn":""); }
+const DEFAULT_NOTE = EMBED ? "Model built into this file · WebGPU · works fully offline"
+                           : "One local HTML file · WebGPU · each model downloads once, then runs offline";
+function setNote(t, warn){ footNote.textContent = (t || DEFAULT_NOTE); footNote.className = "foot-note" + (warn?" warn":""); }
+setNote(null);
 function updateUi(){
   const hasInput = !!inputEl.value.trim() || attachments.length > 0;
   sendBtn.disabled = generating || !hasInput || attProcessing();
@@ -15305,6 +15334,50 @@ function showError(msg){
   deviceChip.textContent = "failed"; setNote("Model failed to load — see above.", true); updateUi();
 }
 
+// Decode base64 straight into `target` at `offset` (native fast path when the
+// browser has it; otherwise atob in 4 MB slices, which keep 4-char alignment).
+function decodeB64Into(b64, target, offset){
+  if (typeof target.setFromBase64 === "function") return target.subarray(offset).setFromBase64(b64).written;
+  let o = offset; const CH = 4 * 1024 * 1024;
+  for (let i = 0; i < b64.length; i += CH){
+    const bin = atob(b64.slice(i, i + CH));
+    for (let j = 0; j < bin.length; j++) target[o++] = bin.charCodeAt(j);
+  }
+  return o - offset;
+}
+// Unpack the built-in model files into WebLLM's caches (skipping any already
+// there), then drop them from the page so the big text isn't kept in memory.
+async function importEmbedded(onProgress){
+  if (embedImported) return;
+  if (typeof caches === "undefined") throw new Error("This browser can't store the built-in model here (Cache Storage is unavailable).");
+  const parts = new Map();
+  for (const el of document.querySelectorAll('script[type="' + EMBED_FILE_TYPE + '"]')){
+    const u = el.dataset.url; if (!parts.has(u)) parts.set(u, []); parts.get(u).push(el);
+  }
+  const total = EMBED.files.reduce((s, f) => s + f.size, 0) || 1;
+  let done = 0;
+  for (const f of EMBED.files){
+    const els = (parts.get(f.url) || []).sort((a, b) => a.dataset.part - b.dataset.part);
+    const name = f.url.split("/").pop();
+    const cache = await caches.open(f.cache);
+    if (!(await cache.match(f.url))){
+      if (els.length !== f.parts) throw new Error("This file is incomplete (part of " + name + " is missing) — please download it again.");
+      const bytes = new Uint8Array(f.size); let o = 0;
+      for (const el of els) o += decodeB64Into(el.textContent, bytes, o);
+      if (o !== f.size) throw new Error("This file is damaged (" + name + " has the wrong size) — please download it again.");
+      try { await cache.put(f.url, new Response(bytes, { headers: { "Content-Type": f.type || "application/octet-stream" } })); }
+      catch (e) {
+        if (e && e.name === "QuotaExceededError") throw new Error("Not enough free storage to set up the built-in model (it needs about " + Math.ceil(total / 1048576) + " MB). Free up some space and reopen this file.");
+        throw e;
+      }
+    }
+    for (const el of els) el.remove();
+    done += f.size; if (onProgress) onProgress(done / total);
+    await new Promise((r) => setTimeout(r, 0));   // let the progress bar paint
+  }
+  embedImported = true;
+}
+
 async function loadModel(){
   ready = false;
   messagesEl.querySelectorAll(".card.error").forEach(n=>n.remove());
@@ -15312,6 +15385,16 @@ async function loadModel(){
     showError("This single-file version needs WebGPU, which isn't available in this browser. " +
       "Most Chromebooks from ~2023 on have it (Chrome 113+). Check chrome://gpu, update Chrome, or use the online version which also has a CPU mode.");
     return;
+  }
+  if (!embedImported){
+    showLoader("Getting the built-in model ready…");
+    $("loadDetail").textContent = "Unpacking the model stored in this file (takes a moment the first time)…";
+    try {
+      await importEmbedded((f) => { const pct = Math.round(f * 100); $("barfill").style.width = pct + "%"; $("loadPct").textContent = pct + "%"; });
+    } catch (err) {
+      showError(String((err && err.message) || err));
+      return;
+    }
   }
   const level = effectiveThrottle();
   const name = MODELS[modelSelect.value].label.split(" — ")[0];

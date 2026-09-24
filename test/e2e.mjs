@@ -7,7 +7,9 @@
 import { chromium } from "playwright-core";
 import http from "http";
 import { readFile } from "fs/promises";
-import { writeFileSync, mkdtempSync } from "fs";
+import { writeFileSync, mkdtempSync, mkdirSync, readFileSync } from "fs";
+import { randomBytes, createHash } from "crypto";
+import { execFileSync } from "child_process";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -662,6 +664,76 @@ const check = (name, cond, extra = "") => {
   } catch (e) { text = "ERROR " + e; }
   check("attach: offline OCR reads the image text (network blocked)", /Grocery total is 42/i.test(text || ""), JSON.stringify((text || "").slice(0, 80)));
   await page.close();
+}
+
+// ---------- Test 14g: a model BUILT INTO the file loads with no download ----------
+// Builds a synthetic model in the download layout, embeds it with
+// build-embedded.mjs (tiny parts, to exercise chunking), then opens the result
+// from file:// with every network request blocked and checks that the files land
+// byte-identical in the caches WebLLM reads — and that WebLLM agrees it's ready.
+{
+  const tmp = mkdtempSync(path.join(os.tmpdir(), "embed-"));
+  const repo = path.join(tmp, "models", "mlc-ai", "Qwen2.5-0.5B-Instruct-q4f16_1-MLC", "resolve", "main");
+  mkdirSync(repo, { recursive: true }); mkdirSync(path.join(tmp, "models", "libs"), { recursive: true });
+  const s0 = randomBytes(2 * 1024 * 1024 + 321), s1 = randomBytes(900 * 1024 + 5), lib = randomBytes(150 * 1024);
+  writeFileSync(path.join(repo, "mlc-chat-config.json"), JSON.stringify({ tokenizer_files: ["tokenizer.json", "vocab.json"] }));
+  writeFileSync(path.join(repo, "tensor-cache.json"), JSON.stringify({ metadata: {}, records: [{ dataPath: "params_shard_0.bin", records: [] }, { dataPath: "params_shard_1.bin", records: [] }] }));
+  writeFileSync(path.join(repo, "params_shard_0.bin"), s0); writeFileSync(path.join(repo, "params_shard_1.bin"), s1);
+  writeFileSync(path.join(repo, "tokenizer.json"), JSON.stringify({ model: { type: "BPE" } }));
+  writeFileSync(path.join(tmp, "models", "libs", "Qwen2-0.5B-Instruct-q4f16_1_cs1k-webgpu.wasm"), lib);
+  const out = path.join(tmp, "embedded.html");
+  execFileSync(process.execPath, ["--no-warnings", path.join(root, "build-embedded.mjs"), "--models", "qwen",
+    "--models-dir", path.join(tmp, "models"), "--part-mb", "1", "--out", out], { stdio: "ignore" });
+  const hub = "https://huggingface.co/mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC/resolve/main/";
+  const sha = (b) => createHash("sha256").update(b).digest("hex");
+  const want = {
+    [hub + "params_shard_0.bin"]: ["webllm/model", sha(s0)],
+    [hub + "params_shard_1.bin"]: ["webllm/model", sha(s1)],
+    [hub + "mlc-chat-config.json"]: ["webllm/config", sha(readFileSync(path.join(repo, "mlc-chat-config.json")))],
+    "https://raw.githubusercontent.com/mlc-ai/binary-mlc-llm-libs/main/web-llm-models/v0_2_84/base/Qwen2-0.5B-Instruct-q4f16_1_cs1k-webgpu.wasm": ["webllm/wasm", sha(lib)],
+  };
+
+  const ctx = await browser.newContext();
+  const net = [], errs = [];
+  const openIt = async () => {
+    const page = await ctx.newPage();
+    page.on("pageerror", (e) => errs.push(String(e)));
+    await page.addInitScript(() => { window.name = "localai-app"; });
+    await page.route("**/*", (r) => { const u = r.request().url(); if (u.startsWith("file:")) return r.continue(); net.push(u); return r.abort(); });
+    await page.goto("file://" + out + "?thinktest=1", { waitUntil: "load" });
+    await page.waitForTimeout(1000);
+    return page;
+  };
+  let page = await openIt();
+  const info = await page.evaluate(() => ({
+    e: window.__thinkTest.embedInfo(), left: window.__thinkTest.payloadLeft(),
+    label: document.querySelector("#modelSelect").selectedOptions[0].textContent,
+    hero: document.getElementById("heroText").textContent,
+  }));
+  check("embed: the file carries a manifest for the built-in model", !!info.e && info.e.models[0] === "qwen25-05b" && info.e.files.length === 6, JSON.stringify(info.e && info.e.files.length));
+  check("embed: model data is chunked into parts inside the page", info.left > 5, "parts=" + info.left);
+  check("embed: opens on the built-in model, labelled 'built in'", /Qwen2\.5/.test(info.label) && /built in ✓/.test(info.label), info.label);
+  check("embed: the page says the model is built in (nothing to download)", /built into this file/.test(info.hero));
+  await page.evaluate(() => window.__thinkTest.importEmbedded());
+  const got = await page.evaluate(async (want) => {
+    const out = {};
+    for (const [url, [name]] of Object.entries(want)) {
+      const r = await (await caches.open(name)).match(url);
+      out[url] = r ? [...new Uint8Array(await crypto.subtle.digest("SHA-256", await r.arrayBuffer()))].map((b) => b.toString(16).padStart(2, "0")).join("") : null;
+    }
+    return { out, left: window.__thinkTest.payloadLeft(), ready: await window.__thinkTest.webllmHasModel("Qwen2.5-0.5B-Instruct-q4f16_1-MLC") };
+  }, want);
+  check("embed: every file is unpacked byte-identical into the cache WebLLM reads",
+    Object.entries(want).every(([u, [, h]]) => got.out[u] === h), JSON.stringify(got.out).slice(0, 160));
+  check("embed: WebLLM's own hasModelInCache() reports the model ready", got.ready === true);
+  check("embed: the embedded copy is dropped from the page after unpacking", got.left === 0);
+  await page.close();
+  page = await openIt();   // reopen: already unpacked, so it's a quick no-op
+  await page.evaluate(() => window.__thinkTest.importEmbedded());
+  check("embed: reopening is instant and still ready", await page.evaluate(() => window.__thinkTest.webllmHasModel("Qwen2.5-0.5B-Instruct-q4f16_1-MLC")));
+  check("embed: zero network requests were attempted", net.length === 0, net.slice(0, 2).join(" "));
+  check("embed: no page errors", errs.filter((e) => !/webgpu/i.test(e)).length === 0, errs.join(" | "));
+  await ctx.close();
 }
 
 // ---------- Test 15: the offline-package build is valid and runs ----------
