@@ -640,6 +640,30 @@ const check = (name, cond, extra = "") => {
   await page.close();
 }
 
+// ---------- Test 14e: OCR engine is inlined and reads image text with NO network ----------
+{
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+  await page.addInitScript(() => { window.name = "localai-app"; });
+  // Allow only the local test server (the app itself); block everything else so
+  // a stray CDN fetch would fail the OCR — proving it's truly offline.
+  await page.route("**/*", (r) => (r.request().url().startsWith(`http://localhost:${PORT}`) ? r.continue() : r.abort()));
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html?thinktest=1`, { waitUntil: "load" });
+  await page.waitForTimeout(800);
+  const inlined = await page.evaluate(() => window.__thinkTest.ocrInlined());
+  check("attach: OCR engine is bundled into the file (not a CDN)", inlined === true);
+  let text = "";
+  try {
+    text = await page.evaluate(async () => {
+      const c = document.createElement("canvas"); c.width = 760; c.height = 130;
+      const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+      g.fillStyle = "#000"; g.font = "38px Georgia"; g.fillText("Grocery total is 42 dollars", 20, 82);
+      return await window.__thinkTest.ocrDataUrl(c.toDataURL("image/png"));
+    });
+  } catch (e) { text = "ERROR " + e; }
+  check("attach: offline OCR reads the image text (network blocked)", /Grocery total is 42/i.test(text || ""), JSON.stringify((text || "").slice(0, 80)));
+  await page.close();
+}
+
 // ---------- Test 15: the offline-package build is valid and runs ----------
 // Served over http (not file://), with no models present. Catches inline-bundle
 // identifier collisions (e.g. a top-level `lib`) and confirms the local-appConfig

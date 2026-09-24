@@ -233,18 +233,32 @@ file, or use the "Download the offline single-file version" link on the main app
 
 It bundles the WebLLM engine inline (so nothing loads from a CDN) and offers the
 three requested models — **Qwen2.5 0.5B, Llama 3.2 1B, Gemma 2 2B** — running on
-**WebGPU**. Notes:
+**WebGPU**. It also has:
+
+- **Think mode** (🧠, on by default) — the model reasons step-by-step (which
+  makes these small models much more accurate), streaming the reasoning live and
+  then collapsing it into a "Thoughts" toggle, leaving a clean answer.
+- **Attachments** (📎, drag-drop, or paste) — text/code/data files are read and
+  given to the model; images are shown inline and run through **OCR** so the
+  model can read any text in them. These are text-only models, so images without
+  text are labelled as such (they can't "see" pictures).
+
+Notes:
 
 - **First run needs internet once per model** — ~3 GB of weights can't be
   embedded in an HTML file, so each model downloads from the web the first time
-  and is then cached in the browser and runs **fully offline** afterward.
+  and is then cached in the browser and runs **fully offline** afterward. The
+  OCR engine (Tesseract + English data, ~7 MB) *is* inlined, so image
+  text-reading needs no network at any point.
 - **Needs WebGPU** (Chrome 113+, which nearly all Chromebooks from ~2023 have).
   Unlike the hosted app, this single file can't use the CPU engine, because
   `file://` blocks the Web Workers that path needs — so if a device has no
-  WebGPU it shows a clear message and you'd use the hosted app instead.
-- Rebuild it after editing the template with `npm run build:standalone`
-  (regenerates `localai-standalone.html` from `standalone.template.html` +
-  the vendored WebLLM bundle).
+  WebGPU it shows a clear message and you'd use the hosted app instead. (OCR
+  still works: its worker is created from a Blob URL, which `file://` allows.)
+- The file is ~16 MB (WebLLM engine + OCR engine inlined). Rebuild it after
+  editing the template with `npm run build:standalone` (regenerates
+  `localai-standalone.html` from `standalone.template.html` + the vendored
+  WebLLM and Tesseract assets).
 
 ## A folder with the models on disk (`offline-package/`)
 

@@ -237,7 +237,7 @@ function replyHTML(raw, streaming){
   return h + '<div class="answer">'+render(answer)+cur+'</div>';
 }
 // Test hook (guarded): lets the e2e suite exercise the real think-parsing.
-try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })) }; } catch {}
+try { if (location.search.includes("thinktest=1")) window.__thinkTest = { splitThink, replyHTML, setThinking:(v)=>{ thinkingMode = v; }, buildModelContent, isTextFile:(name,type)=>isTextFile({name,type:type||""}), getAttachments:()=>attachments.map((a)=>({ kind:a.kind, name:a.name, status:a.status, text:a.text, note:a.note })), ocrInlined:()=>OCR_INLINED, ocrDataUrl:async(u)=>{ const w=await ensureOCR(); const { data }=await w.recognize(u); return data.text; } }; } catch {}
 function addBubble(role, text){
   heroEl.hidden = true;
   const w = document.createElement("div"); w.className = "msg " + (role==="user"?"user":"bot");
@@ -384,11 +384,20 @@ function finishReply(){
  * Attachments: images (shown inline + OCR'd for any text) and text/code files
  * (read and given to the model). These are text-only models — they can't "see"
  * pictures, so for images we extract text via OCR and tell the model that's all
- * it has. OCR uses Tesseract, fetched on first use (needs internet once, like
- * the model itself); the rest works fully offline.
+ * it has. The OCR engine (Tesseract) is inlined into this file, so it — like
+ * everything else here — needs no network at all.
  * ========================================================================== */
-const OCR_MAIN = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
-const OCR_PATHS = {
+// The OCR engine (Tesseract) is inlined by the build so image text-reading works
+// fully offline. The four base64 blobs below are injected into these placeholders
+// by build-standalone.mjs; if a raw (unbuilt) template is opened, they stay as
+// placeholders and OCR falls back to the CDN.
+const TESS_MAIN_B64 = "__TESS_MAIN_B64__";
+const TESS_WORKER_B64 = "__TESS_WORKER_B64__";
+const TESS_CORE_B64 = "__TESS_CORE_B64__";
+const TESS_LANG_B64 = "__TESS_LANG_B64__";
+const OCR_INLINED = !TESS_MAIN_B64.startsWith("__TESS");
+const OCR_CDN_MAIN = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+const OCR_CDN_PATHS = {
   workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
   corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
   langPath: "https://tessdata.projectnaptha.com/4.0.0",
@@ -402,11 +411,36 @@ function isTextFile(file){ return (file.type && file.type.startsWith("text/")) |
 function fileToDataURL(file){ return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(file); }); }
 function downscale(dataUrl, maxDim){ return new Promise((res) => { const img = new Image(); img.onload = () => { let w = img.width, h = img.height; const scale = Math.min(1, maxDim/Math.max(w,h)); const cw = Math.max(1,Math.round(w*scale)), ch = Math.max(1,Math.round(h*scale)); const c = document.createElement("canvas"); c.width = cw; c.height = ch; c.getContext("2d").drawImage(img,0,0,cw,ch); try { res(c.toDataURL("image/png")); } catch { res(dataUrl); } }; img.onerror = () => res(dataUrl); img.src = dataUrl; }); }
 function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error("couldn't load "+src)); document.head.appendChild(s); }); }
+function b64ToU8(b64){ const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; }
+// A self-contained OCR worker: Tesseract's worker code preceded by a shim that
+// serves the inlined engine + language data, so it needs no network and runs
+// from file:// (blob-URL workers are allowed there).
+function ocrWorkerURL(){
+  const workerJs = new TextDecoder().decode(b64ToU8(TESS_WORKER_B64));
+  const prelude = "(function(){"
+    + "function b(x){var s=atob(x),u=new Uint8Array(s.length);for(var i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u;}"
+    + "var CORE=new TextDecoder().decode(b(" + JSON.stringify(TESS_CORE_B64) + "));"
+    + "var LANG=b(" + JSON.stringify(TESS_LANG_B64) + ");"
+    + "var _is=self.importScripts.bind(self);"
+    + "self.importScripts=function(){for(var i=0;i<arguments.length;i++){var u=String(arguments[i]);if(/tesseract-core/i.test(u)){(0,eval)(CORE);}else{_is(arguments[i]);}}};"
+    + "var _f=self.fetch?self.fetch.bind(self):null;"
+    + "self.fetch=function(inp,ini){var s=(inp&&inp.url)?inp.url:String(inp);"
+    + "if(/traineddata/i.test(s))return Promise.resolve(new Response(LANG,{status:200,headers:{'Content-Type':'application/octet-stream'}}));"
+    + "if(/tesseract-core/i.test(s))return Promise.resolve(new Response(CORE,{status:200,headers:{'Content-Type':'text/javascript'}}));"
+    + "return _f?_f(inp,ini):Promise.reject(new Error('offline'));};"
+    + "})();";
+  return URL.createObjectURL(new Blob([prelude + "\n" + workerJs], { type:"text/javascript" }));
+}
 async function ensureOCR(){
   if (_ocr) return _ocr;
   if (!_ocrLoading) _ocrLoading = (async () => {
-    if (typeof Tesseract === "undefined") await loadScript(OCR_MAIN);
-    _ocr = await Tesseract.createWorker("eng", 1, OCR_PATHS);
+    if (OCR_INLINED){
+      if (typeof Tesseract === "undefined") (0, eval)(new TextDecoder().decode(b64ToU8(TESS_MAIN_B64)));
+      _ocr = await Tesseract.createWorker("eng", 1, { workerPath: ocrWorkerURL(), workerBlobURL: false, corePath: "tesscore/", langPath: "tesslang/", cacheMethod: "none", gzip: true });
+    } else {
+      if (typeof Tesseract === "undefined") await loadScript(OCR_CDN_MAIN);
+      _ocr = await Tesseract.createWorker("eng", 1, OCR_CDN_PATHS);
+    }
     return _ocr;
   })().catch((e) => { _ocrLoading = null; throw e; });
   return _ocrLoading;
@@ -419,7 +453,7 @@ async function runOCR(att, imgDataUrl){
     att.text = (data && data.text ? data.text.trim() : "");
     att.note = att.text ? "" : "no text found";
   } catch (e) {
-    att.text = ""; att.note = (navigator.onLine === false) ? "offline — image text unread" : "couldn't read image text";
+    att.text = ""; att.note = "couldn't read image text";
   }
   att.status = "ready"; renderAttachRow(); updateUi();
 }
