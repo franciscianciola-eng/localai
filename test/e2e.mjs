@@ -526,11 +526,13 @@ const check = (name, cond, extra = "") => {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
   const popups = [];
   page.on("popup", (p) => popups.push(p));
-  await page.goto(`http://localhost:${PORT}/localai-standalone.html`, { waitUntil: "load" });
-  await page.waitForTimeout(800);
-  // A normal tab shows the launcher (not the app itself).
-  const hasLauncher = await page.$("#openWin");
-  const appGone = await page.evaluate(() => !document.getElementById("modelSelect"));
+  // The launcher stops loading the rest of the file, so wait for the button,
+  // not the load event.
+  await page.goto(`http://localhost:${PORT}/localai-standalone.html`, { waitUntil: "commit" });
+  const hasLauncher = await page.waitForSelector("#openWin", { timeout: 15000 }).catch(() => null);
+  await page.waitForTimeout(300);
+  // A normal tab shows the launcher (not the app itself) — and never parsed the app.
+  const appGone = await page.evaluate(() => !document.getElementById("modelSelect") && !document.querySelector('script[type="module"]'));
   check("standalone shows a separate-window launcher in a normal tab", !!hasLauncher && appGone);
   // Clicking it opens a real separate window that runs the app.
   await page.click("#openWin").catch(() => {});

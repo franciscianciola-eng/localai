@@ -90,6 +90,46 @@
 </style>
 </head>
 <body>
+<script>
+/* Early launcher — runs before the rest of this (possibly very large) file is
+   parsed. Unless this is already the dedicated app window, stop loading right
+   here, so a file with a model built in isn't parsed twice (here and in the
+   pop-out), and show a one-click card that opens the app in its own window. */
+(function(){
+  if (window.name === "localai-app" || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches)) return;
+  try { window.stop(); } catch (e) {}
+  function openAppWindow(){
+    var aw = screen.availWidth || 1200, ah = screen.availHeight || 820;
+    var w = Math.min(1120, Math.max(880, aw - 200)), h = Math.min(880, Math.max(620, ah - 120));
+    return window.open(location.href, "localai-app", "popup=yes,width=" + w + ",height=" + h +
+      ",left=" + Math.round((aw - w) / 2) + ",top=" + Math.round((ah - h) / 2));
+  }
+  var win = null; try { win = openAppWindow(); } catch (e) {}   // usually needs the click below
+  document.title = "LocalAI — launcher";
+  document.body.innerHTML =
+    '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px">' +
+      '<div class="card" style="max-width:440px;text-align:center">' +
+        '<div class="logo" style="font-size:22px;margin-bottom:4px">Local<span>AI</span></div>' +
+        '<p style="color:var(--muted);margin:8px 0 20px">A private AI that runs on your device — in its own window.</p>' +
+        '<button class="primary" id="openWin" style="font-size:15px;padding:11px 22px">⇱ Open LocalAI</button>' +
+        '<div id="launchNote" style="color:var(--muted);font-size:12.5px;margin-top:16px;min-height:1.4em"></div>' +
+        '<div style="margin-top:12px"><a href="#" id="useTab" style="color:var(--muted);font-size:12px">or just use it in this tab</a></div>' +
+      '</div></div>';
+  var note = document.getElementById("launchNote"), btn = document.getElementById("openWin");
+  function opened(){ note.textContent = "✓ Opened in its own window — you can close this tab."; btn.textContent = "Reopen window"; }
+  if (win) opened(); else note.textContent = "Click to open it in a separate window.";
+  btn.addEventListener("click", function(){
+    // Already open? Just bring it forward — reopening would reload the whole file.
+    if (win && !win.closed){ try { win.focus(); } catch (e) {} return; }
+    win = openAppWindow();
+    if (win){ opened(); try { win.focus(); } catch (e) {} }
+    else note.textContent = "Your browser blocked the pop-out — allow pop-ups for this page, or use it in this tab below.";
+  });
+  document.getElementById("useTab").addEventListener("click", function(e){
+    e.preventDefault(); try { window.name = "localai-app"; } catch (x) {} location.reload();
+  });
+})();
+</script>
 
 <header>
   <div class="logo">Local<span>AI</span> <span style="font-weight:400;color:var(--muted);font-size:12px">offline</span></div>
@@ -15691,7 +15731,9 @@ console.log("LocalAI " + APP_VERSION);
  * Open in a separate app window, not just a tab in the browser.
  * A double-clicked file always opens as a tab, so — unless we're already the
  * dedicated window — we show a one-click launcher that pops the app out into
- * its own sized browser window (its own taskbar entry, not a tab).
+ * its own sized browser window (its own taskbar entry, not a tab). The early
+ * script at the top of <body> normally does this before the rest of the file is
+ * parsed (and stops loading); this is the fallback if that script didn't run.
  * ========================================================================== */
 const IS_APP_WINDOW = window.name === "localai-app" ||
   (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
@@ -15723,8 +15765,9 @@ function launchInSeparateWindow(){
   const opened = () => { note.textContent = "✓ Opened in its own window — you can close this tab."; btn.textContent = "Reopen window"; };
   if (win) opened(); else note.textContent = "Click to open it in a separate window.";
   btn.addEventListener("click", () => {
-    const w2 = openAppWindow();
-    if (w2){ opened(); try { w2.focus(); } catch {} }
+    if (win && !win.closed){ try { win.focus(); } catch {} return; }   // don't reload an open window
+    win = openAppWindow();
+    if (win){ opened(); try { win.focus(); } catch {} }
     else note.textContent = "Your browser blocked the pop-out — allow pop-ups for this page, or use it in this tab below.";
   });
   document.getElementById("useTab").addEventListener("click", (e) => {
